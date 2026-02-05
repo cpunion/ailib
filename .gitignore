@@ -1,0 +1,11 @@
+# Go
+/bin/
+/obj/
+*.exe
+*.test
+*.out
+
+# Editors/OS
+.DS_Store
+.idea/
+.vscode/
