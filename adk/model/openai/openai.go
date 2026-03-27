@@ -41,6 +41,8 @@ type ClientConfig struct {
 	// BaseURL is the base URL for the API (e.g., "https://api.example.com/v1").
 	// If empty, will be inferred from the model name.
 	BaseURL string
+	// Provider is the logical provider ID (for example openai, openrouter, codex).
+	Provider string
 	// HTTPClient is the HTTP client to use (optional)
 	HTTPClient *http.Client
 }
@@ -121,15 +123,16 @@ func (m *openAIModel) GenerateContent(ctx context.Context, req *model.LLMRequest
 
 // OpenAI API types
 type openAIRequest struct {
-	Model          string                `json:"model"`
-	Messages       []openAIMessage       `json:"messages"`
-	Tools          []openAITool          `json:"tools,omitempty"`
-	Temperature    *float64              `json:"temperature,omitempty"`
-	MaxTokens      *int                  `json:"max_tokens,omitempty"`
-	TopP           *float64              `json:"top_p,omitempty"`
-	Stop           []string              `json:"stop,omitempty"`
-	Stream         bool                  `json:"stream,omitempty"`
-	ResponseFormat *openAIResponseFormat `json:"response_format,omitempty"`
+	Model           string                `json:"model"`
+	Messages        []openAIMessage       `json:"messages"`
+	Tools           []openAITool          `json:"tools,omitempty"`
+	ReasoningEffort *string               `json:"reasoning_effort,omitempty"`
+	Temperature     *float64              `json:"temperature,omitempty"`
+	MaxTokens       *int                  `json:"max_tokens,omitempty"`
+	TopP            *float64              `json:"top_p,omitempty"`
+	Stop            []string              `json:"stop,omitempty"`
+	Stream          bool                  `json:"stream,omitempty"`
+	ResponseFormat  *openAIResponseFormat `json:"response_format,omitempty"`
 }
 
 type openAIResponseFormat struct {
@@ -201,15 +204,19 @@ func (m *openAIModel) convertRequest(req *model.LLMRequest) (*openAIRequest, err
 		Messages: make([]openAIMessage, 0),
 	}
 
-	// Add system instruction if present
+	// Add system instruction if present.
+	sysContent := ""
 	if req.Config != nil && req.Config.SystemInstruction != nil {
-		sysContent := extractTextFromContent(req.Config.SystemInstruction)
+		sysContent = extractTextFromContent(req.Config.SystemInstruction)
 		if sysContent != "" {
 			openaiReq.Messages = append(openaiReq.Messages, openAIMessage{
 				Role:    "system",
 				Content: sysContent,
 			})
 		}
+	}
+	if effort := resolveReasoningEffort(m.config.Provider, sysContent); effort != "" {
+		openaiReq.ReasoningEffort = &effort
 	}
 
 	// Convert contents to messages
@@ -255,6 +262,41 @@ func (m *openAIModel) convertRequest(req *model.LLMRequest) (*openAIRequest, err
 	}
 
 	return openaiReq, nil
+}
+
+func resolveReasoningEffort(provider, systemInstruction string) string {
+	if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
+		return ""
+	}
+	level := parseThinkingLevel(systemInstruction)
+	switch level {
+	case "minimal", "low", "medium", "high", "xhigh":
+		return level
+	default:
+		return ""
+	}
+}
+
+func parseThinkingLevel(systemInstruction string) string {
+	text := strings.TrimSpace(systemInstruction)
+	if text == "" {
+		return ""
+	}
+	idx := strings.LastIndex(strings.ToLower(text), "thinking=")
+	if idx < 0 {
+		return ""
+	}
+	raw := text[idx+len("thinking="):]
+	if cut := strings.IndexAny(raw, " |\n\r\t"); cut >= 0 {
+		raw = raw[:cut]
+	}
+	v := strings.ToLower(strings.TrimSpace(raw))
+	switch v {
+	case "extra-high", "extra_high", "extrahigh", "x-high", "x_high":
+		return "xhigh"
+	default:
+		return v
+	}
 }
 
 // convertContent converts genai.Content to OpenAI messages
