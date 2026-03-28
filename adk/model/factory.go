@@ -3,6 +3,7 @@ package model
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -41,30 +42,22 @@ func ParseModelString(modelWithProvider string) (provider, model string) {
 		return ProviderOpenRouter, ""
 	}
 
-	if strings.EqualFold(raw, ProviderMockEcho) {
-		return ProviderMockEcho, ""
-	}
-	mockEchoPrefix := ProviderMockEcho + ":"
-	if len(raw) >= len(mockEchoPrefix) && strings.EqualFold(raw[:len(mockEchoPrefix)], mockEchoPrefix) {
-		return ProviderMockEcho, raw[len(mockEchoPrefix):]
-	}
-	if strings.HasPrefix(raw, ProviderOpenRouter+":") {
-		return ProviderOpenRouter, strings.TrimPrefix(raw, ProviderOpenRouter+":")
-	}
-	if strings.HasPrefix(raw, ProviderOpenAI+":") {
-		return ProviderOpenAI, strings.TrimPrefix(raw, ProviderOpenAI+":")
-	}
-	if strings.HasPrefix(raw, ProviderCodex+":") {
-		return ProviderCodex, strings.TrimPrefix(raw, ProviderCodex+":")
-	}
-	if strings.HasPrefix(raw, ProviderGemini+":") {
-		return ProviderGemini, strings.TrimPrefix(raw, ProviderGemini+":")
-	}
-	if strings.HasPrefix(raw, ProviderVertexAI+":") {
-		return ProviderVertexAI, strings.TrimPrefix(raw, ProviderVertexAI+":")
-	}
-	if strings.HasPrefix(raw, ProviderMock+":") {
-		return ProviderMock, strings.TrimPrefix(raw, ProviderMock+":")
+	for _, providerName := range []string{
+		ProviderMockEcho,
+		ProviderOpenRouter,
+		ProviderOpenAI,
+		ProviderCodex,
+		ProviderGemini,
+		ProviderVertexAI,
+		ProviderMock,
+	} {
+		if strings.EqualFold(raw, providerName) {
+			return providerName, ""
+		}
+		prefix := providerName + ":"
+		if len(raw) >= len(prefix) && strings.EqualFold(raw[:len(prefix)], prefix) {
+			return providerName, raw[len(prefix):]
+		}
 	}
 	return ProviderOpenRouter, raw
 }
@@ -237,6 +230,16 @@ func NewWith(ctx context.Context, modelWithProvider, apiKey, baseURL string) (ad
 				return nil, err
 			}
 			llm = NewMockEchoLLMWithConfig(cfg)
+			break
+		}
+		if specRaw, err := ResolveMockSpec(specModelName); err != nil {
+			return nil, err
+		} else if strings.HasPrefix(strings.TrimSpace(specRaw), "{") {
+			var spec MockSpec
+			if err := json.Unmarshal([]byte(specRaw), &spec); err != nil {
+				return nil, fmt.Errorf("invalid mock spec: %w", err)
+			}
+			llm = NewMockSpecLLM(spec)
 			break
 		}
 		text := strings.TrimSpace(specModelName)

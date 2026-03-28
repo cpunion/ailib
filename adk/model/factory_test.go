@@ -15,6 +15,7 @@ func TestParseModelString(t *testing.T) {
 		{input: "mock:echo", wantProvider: ProviderMock, wantModel: "echo"},
 		{input: "mock-echo:{\"repeat\":2}", wantProvider: ProviderMockEcho, wantModel: "{\"repeat\":2}"},
 		{input: "openai/gpt-5.1-codex", wantProvider: ProviderOpenRouter, wantModel: "openai/gpt-5.1-codex"},
+		{input: "CoDeX:gpt-5.4-mini", wantProvider: ProviderCodex, wantModel: "gpt-5.4-mini"},
 	}
 
 	for _, tt := range tests {
