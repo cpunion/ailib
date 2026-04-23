@@ -2,6 +2,7 @@ package openai
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"iter"
@@ -234,6 +235,99 @@ func TestCodexResponsesModelFunctionCallRoundTrip(t *testing.T) {
 	}
 	if len(seenInput) != 3 {
 		t.Fatalf("input items=%d", len(seenInput))
+	}
+}
+
+func TestCodexResponsesModelGenerateImage(t *testing.T) {
+	var (
+		seenTools      []map[string]any
+		seenToolChoice any
+	)
+
+	const pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO2Z0ioAAAAASUVORK5CYII="
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll: %v", err)
+		}
+		var req struct {
+			Tools      []map[string]any `json:"tools"`
+			ToolChoice any              `json:"tool_choice"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		seenTools = req.Tools
+		seenToolChoice = req.ToolChoice
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"ig_1\",\"type\":\"image_generation_call\",\"result\":\"" + pngBase64 + "\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"))
+	}))
+	defer ts.Close()
+
+	llm, err := NewCodexResponsesModel(context.Background(), "gpt-5", &ClientConfig{
+		APIKey:     "jwt-token",
+		BaseURL:    ts.URL,
+		HTTPClient: ts.Client(),
+		Provider:   "codex",
+	}, "acct_123")
+	if err != nil {
+		t.Fatalf("NewCodexResponsesModel: %v", err)
+	}
+
+	req := &model.LLMRequest{
+		Contents: []*genai.Content{
+			genai.NewContentFromText("Generate a landscape cover.", genai.RoleUser),
+		},
+		Config: &genai.GenerateContentConfig{
+			ResponseModalities: []string{"IMAGE"},
+			ImageConfig:        &genai.ImageConfig{AspectRatio: "16:9"},
+		},
+	}
+	responses, err := collectResponses(llm.GenerateContent(context.Background(), req, false))
+	if err != nil {
+		t.Fatalf("GenerateContent: %v", err)
+	}
+	if len(responses) != 1 {
+		t.Fatalf("responses=%d", len(responses))
+	}
+	var image *genai.Blob
+	for _, part := range responses[0].Content.Parts {
+		if part != nil && part.InlineData != nil {
+			image = part.InlineData
+			break
+		}
+	}
+	if image == nil {
+		t.Fatal("expected image output")
+	}
+	wantBytes, err := base64.StdEncoding.DecodeString(pngBase64)
+	if err != nil {
+		t.Fatalf("DecodeString: %v", err)
+	}
+	if image.MIMEType != "image/png" {
+		t.Fatalf("mime = %q, want image/png", image.MIMEType)
+	}
+	if string(image.Data) != string(wantBytes) {
+		t.Fatalf("image bytes mismatch")
+	}
+	if len(seenTools) != 1 {
+		t.Fatalf("tools=%d, want 1", len(seenTools))
+	}
+	if seenTools[0]["type"] != "image_generation" {
+		t.Fatalf("tool type = %v", seenTools[0]["type"])
+	}
+	if seenTools[0]["size"] != "1536x1024" {
+		t.Fatalf("tool size = %v", seenTools[0]["size"])
+	}
+	if seenTools[0]["output_format"] != "png" {
+		t.Fatalf("tool output_format = %v", seenTools[0]["output_format"])
+	}
+	choice, ok := seenToolChoice.(map[string]any)
+	if !ok || choice["type"] != "image_generation" {
+		t.Fatalf("tool_choice = %#v", seenToolChoice)
 	}
 }
 

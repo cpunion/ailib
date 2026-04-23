@@ -31,7 +31,7 @@ type codexResponsesRequest struct {
 	Instructions string                   `json:"instructions,omitempty"`
 	Input        []any                    `json:"input,omitempty"`
 	Tools        []codexResponsesTool     `json:"tools,omitempty"`
-	ToolChoice   string                   `json:"tool_choice,omitempty"`
+	ToolChoice   any                      `json:"tool_choice,omitempty"`
 	Reasoning    *codexResponsesReasoning `json:"reasoning,omitempty"`
 }
 
@@ -40,10 +40,16 @@ type codexResponsesReasoning struct {
 }
 
 type codexResponsesTool struct {
-	Type        string         `json:"type"`
-	Name        string         `json:"name"`
-	Description string         `json:"description,omitempty"`
-	Parameters  map[string]any `json:"parameters,omitempty"`
+	Type              string         `json:"type"`
+	Name              string         `json:"name,omitempty"`
+	Description       string         `json:"description,omitempty"`
+	Parameters        map[string]any `json:"parameters,omitempty"`
+	Size              string         `json:"size,omitempty"`
+	Quality           string         `json:"quality,omitempty"`
+	OutputFormat      string         `json:"output_format,omitempty"`
+	OutputCompression *int           `json:"output_compression,omitempty"`
+	Background        string         `json:"background,omitempty"`
+	Action            string         `json:"action,omitempty"`
 }
 
 type codexResponsesEvent struct {
@@ -55,12 +61,15 @@ type codexResponsesEvent struct {
 }
 
 type codexResponsesOutputItem struct {
-	ID        string                        `json:"id,omitempty"`
-	Type      string                        `json:"type"`
-	CallID    string                        `json:"call_id,omitempty"`
-	Name      string                        `json:"name,omitempty"`
-	Arguments string                        `json:"arguments,omitempty"`
-	Content   []codexResponsesOutputContent `json:"content,omitempty"`
+	ID            string                        `json:"id,omitempty"`
+	Type          string                        `json:"type"`
+	CallID        string                        `json:"call_id,omitempty"`
+	Name          string                        `json:"name,omitempty"`
+	Arguments     string                        `json:"arguments,omitempty"`
+	Content       []codexResponsesOutputContent `json:"content,omitempty"`
+	Status        string                        `json:"status,omitempty"`
+	RevisedPrompt string                        `json:"revised_prompt,omitempty"`
+	Result        string                        `json:"result,omitempty"`
 }
 
 type codexResponsesOutputContent struct {
@@ -152,6 +161,8 @@ func (m *codexResponsesModel) GenerateContent(ctx context.Context, req *model.LL
 			textBuilder strings.Builder
 			calls       []*codexResponseCall
 			callsByID   = map[string]*codexResponseCall{}
+			images      []*genai.Blob
+			seenImages  = map[string]struct{}{}
 			usage       *genai.GenerateContentResponseUsageMetadata
 			finish      = genai.FinishReasonStop
 		)
@@ -231,6 +242,24 @@ func (m *codexResponsesModel) GenerateContent(ctx context.Context, req *model.LL
 							}
 						}
 					}
+				case "image_generation_call":
+					itemID := firstNonEmptyString(event.Item.ID, event.Item.CallID, event.ItemID)
+					if event.Type != "response.output_item.done" || strings.TrimSpace(event.Item.Result) == "" {
+						continue
+					}
+					if _, exists := seenImages[itemID]; exists {
+						continue
+					}
+					imageData, err := base64.StdEncoding.DecodeString(strings.TrimSpace(event.Item.Result))
+					if err != nil {
+						yield(nil, fmt.Errorf("failed to decode codex image output: %w", err))
+						return
+					}
+					images = append(images, &genai.Blob{
+						MIMEType: detectCodexImageMimeType(imageData),
+						Data:     imageData,
+					})
+					seenImages[itemID] = struct{}{}
 				}
 			case "response.completed":
 				if event.Response == nil {
@@ -268,7 +297,7 @@ func (m *codexResponsesModel) GenerateContent(ctx context.Context, req *model.LL
 			return
 		}
 
-		finalResp, err := buildCodexFinalResponse(textBuilder.String(), calls, usage, finish)
+		finalResp, err := buildCodexFinalResponse(textBuilder.String(), images, calls, usage, finish)
 		if err != nil {
 			yield(nil, err)
 			return
@@ -316,8 +345,14 @@ func (m *codexResponsesModel) convertRequest(req *model.LLMRequest) (*codexRespo
 				})
 			}
 		}
+		if imageTool, ok := buildCodexImageTool(req.Config); ok {
+			out.Tools = append(out.Tools, imageTool)
+		}
 	}
-	if len(out.Tools) > 0 {
+	switch {
+	case hasOnlyCodexImageTool(out.Tools):
+		out.ToolChoice = map[string]any{"type": "image_generation"}
+	case len(out.Tools) > 0:
 		out.ToolChoice = "auto"
 	}
 	return out, nil
@@ -438,10 +473,16 @@ func (m *codexResponsesModel) sendRequest(ctx context.Context, req *codexRespons
 	return httpResp, nil
 }
 
-func buildCodexFinalResponse(text string, calls []*codexResponseCall, usage *genai.GenerateContentResponseUsageMetadata, finish genai.FinishReason) (*model.LLMResponse, error) {
-	parts := make([]*genai.Part, 0, len(calls)+1)
+func buildCodexFinalResponse(text string, images []*genai.Blob, calls []*codexResponseCall, usage *genai.GenerateContentResponseUsageMetadata, finish genai.FinishReason) (*model.LLMResponse, error) {
+	parts := make([]*genai.Part, 0, len(images)+len(calls)+1)
 	if text != "" {
 		parts = append(parts, genai.NewPartFromText(text))
+	}
+	for _, image := range images {
+		if image == nil || len(image.Data) == 0 {
+			continue
+		}
+		parts = append(parts, &genai.Part{InlineData: image})
 	}
 	for _, call := range calls {
 		if call == nil || strings.TrimSpace(call.name) == "" {
@@ -500,6 +541,63 @@ func firstNonEmptyString(values ...string) string {
 
 func defaultCodexInstructions() string {
 	return "You are a helpful coding assistant. Follow the user's request and call tools when needed."
+}
+
+func buildCodexImageTool(config *genai.GenerateContentConfig) (codexResponsesTool, bool) {
+	if !requestsImageResponse(config) {
+		return codexResponsesTool{}, false
+	}
+	tool := codexResponsesTool{
+		Type:         "image_generation",
+		OutputFormat: "png",
+	}
+	if config == nil || config.ImageConfig == nil {
+		return tool, true
+	}
+	if size := codexImageSize(config.ImageConfig.AspectRatio); size != "" {
+		tool.Size = size
+	}
+	return tool, true
+}
+
+func requestsImageResponse(config *genai.GenerateContentConfig) bool {
+	if config == nil {
+		return false
+	}
+	for _, modality := range config.ResponseModalities {
+		if strings.EqualFold(strings.TrimSpace(modality), "IMAGE") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasOnlyCodexImageTool(tools []codexResponsesTool) bool {
+	if len(tools) != 1 {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(tools[0].Type), "image_generation")
+}
+
+func codexImageSize(aspectRatio string) string {
+	switch strings.TrimSpace(aspectRatio) {
+	case "1:1":
+		return "1024x1024"
+	case "3:4", "9:16":
+		return "1024x1536"
+	case "16:9", "4:3":
+		return "1536x1024"
+	default:
+		return ""
+	}
+}
+
+func detectCodexImageMimeType(data []byte) string {
+	mimeType := strings.TrimSpace(http.DetectContentType(data))
+	if strings.HasPrefix(strings.ToLower(mimeType), "image/") {
+		return mimeType
+	}
+	return "image/png"
 }
 
 func stripCodexToolMetaSchema(schema map[string]any) map[string]any {
