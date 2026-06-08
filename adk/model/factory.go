@@ -163,7 +163,8 @@ func NewFromConfig(ctx context.Context, cfg Config) (adkmodel.LLM, error) {
 	if provider == "" {
 		provider, modelName = ParseModelString(modelName)
 	}
-	apiKey := strings.TrimSpace(cfg.APIKey)
+	explicitAPIKey := strings.TrimSpace(cfg.APIKey)
+	apiKey := explicitAPIKey
 	baseURL := strings.TrimSpace(cfg.BaseURL)
 	if apiKey == "" && provider != ProviderCodex {
 		envVar := GetAPIKeyEnvVar(provider)
@@ -209,7 +210,13 @@ func NewFromConfig(ctx context.Context, cfg Config) (adkmodel.LLM, error) {
 		if strings.TrimSpace(apiKey) == "" {
 			apiKey = strings.TrimSpace(resolution.APIKey)
 		}
-		accountID := strings.TrimSpace(resolution.AccountID)
+		accountID := ""
+		if explicitAPIKey != "" {
+			accountID = strings.TrimSpace(codexauth.ExtractAccountID(explicitAPIKey))
+		}
+		if accountID == "" {
+			accountID = strings.TrimSpace(resolution.AccountID)
+		}
 		if accountID == "" {
 			accountID = strings.TrimSpace(codexauth.ExtractAccountID(apiKey))
 		}

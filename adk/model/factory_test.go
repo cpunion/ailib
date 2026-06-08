@@ -3,9 +3,12 @@ package model
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	providercontract "github.com/cpunion/ailib/adk/model/provider"
+	adkmodel "google.golang.org/adk/model"
+	"google.golang.org/genai"
 )
 
 func TestParseModelString(t *testing.T) {
@@ -93,5 +96,41 @@ func TestNewFromConfigOpenAICompatibleAcceptsAttemptSink(t *testing.T) {
 	}
 	if len(attempts) != 0 {
 		t.Fatalf("attempts should only be observed during generation, got %d", len(attempts))
+	}
+}
+
+func TestNewFromConfigCodexPrefersExplicitAPIKeyAccountID(t *testing.T) {
+	const explicitToken = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF9leHBsaWNpdCJ9fQ."
+	const envToken = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF9lbnYifX0."
+
+	var seenAccount string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAccount = r.Header.Get("chatgpt-account-id")
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"))
+	}))
+	defer ts.Close()
+
+	t.Setenv("CODEX_API_KEY", envToken)
+	llm, err := NewFromConfig(context.Background(), Config{
+		Provider:   ProviderCodex,
+		Model:      "gpt-5.4-mini",
+		APIKey:     explicitToken,
+		BaseURL:    ts.URL + "/backend-api/codex",
+		HTTPClient: ts.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewFromConfig: %v", err)
+	}
+	for _, err := range llm.GenerateContent(context.Background(), &adkmodel.LLMRequest{
+		Contents: []*genai.Content{genai.NewContentFromText("hi", genai.RoleUser)},
+	}, false) {
+		if err != nil {
+			t.Fatalf("GenerateContent: %v", err)
+		}
+	}
+	if seenAccount != "acct_explicit" {
+		t.Fatalf("account=%q", seenAccount)
 	}
 }

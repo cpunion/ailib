@@ -6,12 +6,15 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
 	"net/http"
 	"strings"
+	"time"
 
+	providercontract "github.com/cpunion/ailib/adk/model/provider"
 	"github.com/google/uuid"
 	"google.golang.org/adk/model"
 	"google.golang.org/genai"
@@ -152,12 +155,17 @@ func (m *codexResponsesModel) GenerateContent(ctx context.Context, req *model.LL
 		}
 	}
 	return func(yield func(*model.LLMResponse, error) bool) {
+		start := time.Now()
+		attempt := m.newAttempt()
 		httpResp, err := m.sendRequest(ctx, codexReq)
 		if err != nil {
+			m.applyErrorAttempt(&attempt, err)
+			m.observeAttempt(attempt, start)
 			yield(nil, err)
 			return
 		}
 		defer httpResp.Body.Close()
+		attempt.StatusCode = httpResp.StatusCode
 
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(make([]byte, 0, 64*1024), 4<<20)
@@ -257,7 +265,10 @@ func (m *codexResponsesModel) GenerateContent(ctx context.Context, req *model.LL
 					}
 					imageData, err := base64.StdEncoding.DecodeString(strings.TrimSpace(event.Item.Result))
 					if err != nil {
-						yield(nil, fmt.Errorf("failed to decode codex image output: %w", err))
+						err = fmt.Errorf("failed to decode codex image output: %w", err)
+						m.applyErrorAttempt(&attempt, err)
+						m.observeAttempt(attempt, start)
+						yield(nil, err)
 						return
 					}
 					images = append(images, &genai.Blob{
@@ -285,28 +296,44 @@ func (m *codexResponsesModel) GenerateContent(ctx context.Context, req *model.LL
 					if event.Response.Error != nil && strings.TrimSpace(event.Response.Error.Message) != "" {
 						message = strings.TrimSpace(event.Response.Error.Message)
 					}
-					yield(nil, fmt.Errorf("%s", message))
+					err := fmt.Errorf("%s", message)
+					m.applyErrorAttempt(&attempt, err)
+					m.observeAttempt(attempt, start)
+					yield(nil, err)
 					return
 				}
 			case "error":
 				if msg := codexStreamErrorMessage(event); msg != "" {
-					yield(nil, fmt.Errorf("%s", msg))
+					err := fmt.Errorf("%s", msg)
+					m.applyErrorAttempt(&attempt, err)
+					m.observeAttempt(attempt, start)
+					yield(nil, err)
 					return
 				}
-				yield(nil, fmt.Errorf("codex responses stream error"))
+				err := fmt.Errorf("codex responses stream error")
+				m.applyErrorAttempt(&attempt, err)
+				m.observeAttempt(attempt, start)
+				yield(nil, err)
 				return
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			yield(nil, fmt.Errorf("codex responses stream error: %w", err))
+			err = fmt.Errorf("codex responses stream error: %w", err)
+			m.applyErrorAttempt(&attempt, err)
+			m.observeAttempt(attempt, start)
+			yield(nil, err)
 			return
 		}
 
 		finalResp, err := buildCodexFinalResponse(textBuilder.String(), images, calls, usage, finish)
 		if err != nil {
+			m.applyErrorAttempt(&attempt, err)
+			m.observeAttempt(attempt, start)
 			yield(nil, err)
 			return
 		}
+		applyCodexSuccessAttempt(&attempt, usage, finish, m.accountID)
+		m.observeAttempt(attempt, start)
 		yield(finalResp, nil)
 	}
 }
@@ -522,7 +549,7 @@ func (m *codexResponsesModel) sendRequest(ctx context.Context, req *codexRespons
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(httpResp.Body)
 		httpResp.Body.Close()
-		return nil, fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, strings.TrimSpace(string(raw)))
+		return nil, &openAIHTTPStatusError{StatusCode: httpResp.StatusCode, Body: strings.TrimSpace(string(raw))}
 	}
 	return httpResp, nil
 }
@@ -582,6 +609,73 @@ func buildCodexUsageMetadata(usage *codexResponsesUsage) *genai.GenerateContentR
 		return nil
 	}
 	return out
+}
+
+func (m *codexResponsesModel) newAttempt() providercontract.ModelAttempt {
+	provider := "codex"
+	if m != nil && m.config != nil && strings.TrimSpace(m.config.Provider) != "" {
+		provider = strings.TrimSpace(m.config.Provider)
+	}
+	baseURL := ""
+	if m != nil && m.config != nil {
+		baseURL = m.config.BaseURL
+	}
+	modelName := ""
+	if m != nil {
+		modelName = m.modelName
+	}
+	return providercontract.ModelAttempt{
+		Provider:     provider,
+		Model:        modelName,
+		EndpointKind: providercontract.EndpointKindCodexBackendResponses,
+		BaseURLClass: providercontract.BaseURLClass(baseURL),
+	}
+}
+
+func (m *codexResponsesModel) applyErrorAttempt(attempt *providercontract.ModelAttempt, err error) {
+	if attempt == nil || err == nil {
+		return
+	}
+	attempt.FailureReason = providercontract.ClassifyError(err)
+	attempt.ErrorClass = errorClass(err)
+	var statusErr *openAIHTTPStatusError
+	if errors.As(err, &statusErr) {
+		attempt.StatusCode = statusErr.StatusCode
+		attempt.FailureReason = providercontract.ClassifyHTTPStatus(statusErr.StatusCode)
+	}
+}
+
+func applyCodexSuccessAttempt(attempt *providercontract.ModelAttempt, usage *genai.GenerateContentResponseUsageMetadata, finish genai.FinishReason, accountID string) {
+	if attempt == nil {
+		return
+	}
+	if attempt.StatusCode == 0 {
+		attempt.StatusCode = http.StatusOK
+	}
+	attempt.FinishReason = string(finish)
+	attempt.NativeFinishReason = string(finish)
+	attempt.Usage = providercontract.Usage{}
+	if usage != nil {
+		attempt.Usage.InputTokens = int64(usage.PromptTokenCount)
+		attempt.Usage.OutputTokens = int64(usage.CandidatesTokenCount)
+		attempt.Usage.TotalTokens = int64(usage.TotalTokenCount)
+		if usage.CachedContentTokenCount > 0 {
+			attempt.Usage.Cache.ReadTokens = int64(usage.CachedContentTokenCount)
+			attempt.Usage.Cache.Hit = true
+		}
+	}
+	attempt.Cache = attempt.Usage.Cache
+	attempt.EndpointState.CodexAccountID = strings.TrimSpace(accountID)
+}
+
+func (m *codexResponsesModel) observeAttempt(attempt providercontract.ModelAttempt, start time.Time) {
+	if m == nil || m.config == nil || m.config.AttemptSink == nil {
+		return
+	}
+	if attempt.LatencyMS == 0 && !start.IsZero() {
+		attempt.LatencyMS = time.Since(start).Milliseconds()
+	}
+	m.config.AttemptSink.ObserveModelAttempt(attempt)
 }
 
 func firstNonEmptyString(values ...string) string {

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	providercontract "github.com/cpunion/ailib/adk/model/provider"
 	"google.golang.org/adk/model"
 	"google.golang.org/genai"
 )
@@ -24,6 +25,7 @@ func TestCodexResponsesModelGenerateText(t *testing.T) {
 		seenStream    bool
 		seenPrompt    string
 		seenInput     []any
+		attempts      []providercontract.ModelAttempt
 	)
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -65,6 +67,9 @@ func TestCodexResponsesModelGenerateText(t *testing.T) {
 		BaseURL:    ts.URL,
 		HTTPClient: ts.Client(),
 		Provider:   "codex",
+		AttemptSink: providercontract.AttemptSinkFunc(func(attempt providercontract.ModelAttempt) {
+			attempts = append(attempts, attempt)
+		}),
 	}, "acct_123")
 	if err != nil {
 		t.Fatalf("NewCodexResponsesModel: %v", err)
@@ -109,6 +114,52 @@ func TestCodexResponsesModelGenerateText(t *testing.T) {
 	}
 	if len(seenInput) != 1 {
 		t.Fatalf("input items=%d", len(seenInput))
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("attempts=%d", len(attempts))
+	}
+	attempt := attempts[0]
+	if attempt.Provider != "codex" || attempt.Model != "gpt-5.4-mini" || attempt.EndpointKind != providercontract.EndpointKindCodexBackendResponses {
+		t.Fatalf("attempt=%+v", attempt)
+	}
+	if attempt.StatusCode != http.StatusOK || attempt.Usage.TotalTokens != 17 || attempt.EndpointState.CodexAccountID != "acct_123" {
+		t.Fatalf("attempt=%+v", attempt)
+	}
+}
+
+func TestCodexResponsesModelAttemptSinkRecordsHTTPFailure(t *testing.T) {
+	var attempts []providercontract.ModelAttempt
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+	}))
+	defer ts.Close()
+
+	llm, err := NewCodexResponsesModel(context.Background(), "gpt-5.4-mini", &ClientConfig{
+		APIKey:     "jwt-token",
+		BaseURL:    ts.URL,
+		HTTPClient: ts.Client(),
+		Provider:   "codex",
+		AttemptSink: providercontract.AttemptSinkFunc(func(attempt providercontract.ModelAttempt) {
+			attempts = append(attempts, attempt)
+		}),
+	}, "acct_123")
+	if err != nil {
+		t.Fatalf("NewCodexResponsesModel: %v", err)
+	}
+
+	_, err = collectResponses(llm.GenerateContent(context.Background(), &model.LLMRequest{
+		Contents: []*genai.Content{genai.NewContentFromText("Say hello.", genai.RoleUser)},
+	}, false))
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("attempts=%d", len(attempts))
+	}
+	attempt := attempts[0]
+	if attempt.StatusCode != http.StatusTooManyRequests || attempt.FailureReason != providercontract.FailoverReasonRateLimit || attempt.ErrorClass != "http_status" {
+		t.Fatalf("attempt=%+v", attempt)
 	}
 }
 
