@@ -21,13 +21,16 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
+	providercontract "github.com/cpunion/ailib/adk/model/provider"
 	"github.com/google/uuid"
 	"google.golang.org/adk/model"
 	"google.golang.org/genai"
@@ -45,6 +48,8 @@ type ClientConfig struct {
 	Provider string
 	// HTTPClient is the HTTP client to use (optional)
 	HTTPClient *http.Client
+	// AttemptSink observes normalized provider attempts (optional).
+	AttemptSink providercontract.AttemptSink
 }
 
 // openAIModel implements the model.LLM interface for OpenAI-compatible APIs.
@@ -187,14 +192,19 @@ type openAIChoice struct {
 }
 
 type openAIUsage struct {
-	PromptTokens        int                  `json:"prompt_tokens"`
-	CompletionTokens    int                  `json:"completion_tokens"`
-	TotalTokens         int                  `json:"total_tokens"`
-	PromptTokensDetails *promptTokensDetails `json:"prompt_tokens_details,omitempty"`
+	PromptTokens            int                      `json:"prompt_tokens"`
+	CompletionTokens        int                      `json:"completion_tokens"`
+	TotalTokens             int                      `json:"total_tokens"`
+	PromptTokensDetails     *promptTokensDetails     `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *completionTokensDetails `json:"completion_tokens_details,omitempty"`
 }
 
 type promptTokensDetails struct {
 	CachedTokens int `json:"cached_tokens,omitempty"`
+}
+
+type completionTokensDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
 }
 
 // convertRequest converts a model.LLMRequest to OpenAI format
@@ -547,17 +557,34 @@ func schemaToMap(schema *genai.Schema) map[string]any {
 // generate performs a non-streaming API call
 func (m *openAIModel) generate(ctx context.Context, openaiReq *openAIRequest) iter.Seq2[*model.LLMResponse, error] {
 	return func(yield func(*model.LLMResponse, error) bool) {
+		start := time.Now()
+		attempt := m.newAttempt()
 		resp, err := m.doRequest(ctx, openaiReq)
 		if err != nil {
+			attempt.FailureReason = providercontract.ClassifyError(err)
+			attempt.ErrorClass = errorClass(err)
+			if statusErr := (*openAIHTTPStatusError)(nil); errors.As(err, &statusErr) {
+				attempt.StatusCode = statusErr.StatusCode
+				attempt.FailureReason = providercontract.ClassifyHTTPStatus(statusErr.StatusCode)
+			}
+			m.observeAttempt(attempt, start)
 			yield(nil, err)
 			return
 		}
+		applyOpenAIResponseAttempt(&attempt, resp)
 
 		llmResp, err := m.convertResponse(resp)
 		if err != nil {
+			attempt.FailureReason = providercontract.ClassifyError(err)
+			attempt.ErrorClass = errorClass(err)
+			m.observeAttempt(attempt, start)
 			yield(nil, err)
 			return
 		}
+		if llmResp != nil {
+			attempt.FinishReason = string(llmResp.FinishReason)
+		}
+		m.observeAttempt(attempt, start)
 		yield(llmResp, nil)
 	}
 }
@@ -567,17 +594,30 @@ func (m *openAIModel) generateStream(ctx context.Context, openaiReq *openAIReque
 	openaiReq.Stream = true
 
 	return func(yield func(*model.LLMResponse, error) bool) {
+		start := time.Now()
+		attempt := m.newAttempt()
 		httpResp, err := m.sendRequest(ctx, openaiReq)
 		if err != nil {
+			attempt.FailureReason = providercontract.ClassifyError(err)
+			attempt.ErrorClass = errorClass(err)
+			if statusErr := (*openAIHTTPStatusError)(nil); errors.As(err, &statusErr) {
+				attempt.StatusCode = statusErr.StatusCode
+				attempt.FailureReason = providercontract.ClassifyHTTPStatus(statusErr.StatusCode)
+			}
+			m.observeAttempt(attempt, start)
 			yield(nil, err)
 			return
 		}
 		defer httpResp.Body.Close()
+		attempt.StatusCode = httpResp.StatusCode
 
 		scanner := bufio.NewScanner(httpResp.Body)
 		var textBuffer strings.Builder
 		var toolCalls []openAIToolCall
 		var usage *openAIUsage
+		var requestID string
+		firstTokenAt := time.Time{}
+		finishReason := ""
 
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -594,6 +634,16 @@ func (m *openAIModel) generateStream(ctx context.Context, openaiReq *openAIReque
 			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 				continue
 			}
+			attempt.StreamChunkCount++
+			if requestID == "" {
+				requestID = strings.TrimSpace(chunk.ID)
+			}
+
+			// Some OpenAI-compatible providers emit a final usage-only chunk with
+			// choices=[]. Record it before inspecting choices.
+			if chunk.Usage != nil {
+				usage = chunk.Usage
+			}
 
 			if len(chunk.Choices) == 0 {
 				continue
@@ -608,6 +658,9 @@ func (m *openAIModel) generateStream(ctx context.Context, openaiReq *openAIReque
 			// Handle text content
 			if delta.Content != nil {
 				if text, ok := delta.Content.(string); ok && text != "" {
+					if firstTokenAt.IsZero() {
+						firstTokenAt = time.Now()
+					}
 					textBuffer.WriteString(text)
 					// Yield partial response
 					llmResp := &model.LLMResponse{
@@ -649,30 +702,47 @@ func (m *openAIModel) generateStream(ctx context.Context, openaiReq *openAIReque
 				}
 			}
 
-			// Handle usage
-			if chunk.Usage != nil {
-				usage = chunk.Usage
-			}
-
 			// Handle finish
 			if choice.FinishReason != "" {
-				finalResp := m.buildFinalResponse(textBuffer.String(), toolCalls, usage, choice.FinishReason)
-				yield(finalResp, nil)
-				return
+				finishReason = choice.FinishReason
 			}
 		}
 
 		if err := scanner.Err(); err != nil {
+			attempt.FailureReason = providercontract.ClassifyError(err)
+			attempt.ErrorClass = errorClass(err)
+			attempt.Usage = buildProviderUsage(usage)
+			attempt.Cache = attempt.Usage.Cache
+			m.observeAttempt(attempt, start)
 			yield(nil, fmt.Errorf("stream error: %w", err))
 			return
 		}
 
-		// Fallback: if stream ended without FinishReason but we have accumulated content,
-		// send the final response. This handles non-compliant OpenAI-compatible APIs.
-		if textBuffer.Len() > 0 || len(toolCalls) > 0 {
-			finalResp := m.buildFinalResponse(textBuffer.String(), toolCalls, usage, "stop")
+		// Emit final response after [DONE] so usage-only final chunks with
+		// choices=[] are not lost.
+		if finishReason != "" || textBuffer.Len() > 0 || len(toolCalls) > 0 || usage != nil {
+			nativeFinishReason := finishReason
+			if nativeFinishReason == "" {
+				nativeFinishReason = "stream_eof"
+				finishReason = "stop"
+			}
+			attempt.RequestID = requestID
+			attempt.ProviderRequestID = requestID
+			attempt.EndpointState.ResponseID = requestID
+			attempt.NativeFinishReason = nativeFinishReason
+			attempt.FinishReason = string(mapFinishReason(finishReason))
+			attempt.Usage = buildProviderUsage(usage)
+			attempt.Cache = attempt.Usage.Cache
+			if !firstTokenAt.IsZero() {
+				attempt.TimeToFirstTokenMS = firstTokenAt.Sub(start).Milliseconds()
+			}
+			m.observeAttempt(attempt, start)
+			finalResp := m.buildFinalResponse(textBuffer.String(), toolCalls, usage, finishReason)
 			yield(finalResp, nil)
+			return
 		}
+		attempt.FailureReason = providercontract.FailoverReasonEmpty
+		m.observeAttempt(attempt, start)
 	}
 }
 
@@ -701,10 +771,22 @@ func (m *openAIModel) sendRequest(ctx context.Context, openaiReq *openAIRequest)
 	if httpResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(httpResp.Body)
 		httpResp.Body.Close()
-		return nil, fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(body))
+		return nil, &openAIHTTPStatusError{StatusCode: httpResp.StatusCode, Body: string(body)}
 	}
 
 	return httpResp, nil
+}
+
+type openAIHTTPStatusError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *openAIHTTPStatusError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf("API error (status %d): %s", e.StatusCode, e.Body)
 }
 
 // doRequest performs the HTTP request to the OpenAI API
@@ -856,6 +938,84 @@ func buildUsageMetadata(usage *openAIUsage) *genai.GenerateContentResponseUsageM
 		metadata.CachedContentTokenCount = int32(usage.PromptTokensDetails.CachedTokens)
 	}
 	return metadata
+}
+
+func buildProviderUsage(usage *openAIUsage) providercontract.Usage {
+	if usage == nil {
+		return providercontract.Usage{}
+	}
+	out := providercontract.Usage{
+		InputTokens:  int64(usage.PromptTokens),
+		OutputTokens: int64(usage.CompletionTokens),
+		TotalTokens:  int64(usage.TotalTokens),
+	}
+	if usage.PromptTokensDetails != nil {
+		out.Cache.ReadTokens = int64(usage.PromptTokensDetails.CachedTokens)
+		out.Cache.Hit = usage.PromptTokensDetails.CachedTokens > 0
+	}
+	if usage.CompletionTokensDetails != nil {
+		out.ReasoningTokens = int64(usage.CompletionTokensDetails.ReasoningTokens)
+	}
+	return out
+}
+
+func (m *openAIModel) newAttempt() providercontract.ModelAttempt {
+	provider := strings.TrimSpace(m.config.Provider)
+	if provider == "" {
+		provider = "openai"
+	}
+	return providercontract.ModelAttempt{
+		Provider:     provider,
+		Model:        m.modelName,
+		EndpointKind: providercontract.EndpointKindChatCompletions,
+		BaseURLClass: providercontract.BaseURLClass(m.config.BaseURL),
+	}
+}
+
+func (m *openAIModel) observeAttempt(attempt providercontract.ModelAttempt, start time.Time) {
+	if m == nil || m.config == nil || m.config.AttemptSink == nil {
+		return
+	}
+	if attempt.LatencyMS == 0 && !start.IsZero() {
+		attempt.LatencyMS = time.Since(start).Milliseconds()
+	}
+	m.config.AttemptSink.ObserveModelAttempt(attempt)
+}
+
+func applyOpenAIResponseAttempt(attempt *providercontract.ModelAttempt, resp *openAIResponse) {
+	if attempt == nil || resp == nil {
+		return
+	}
+	attempt.StatusCode = http.StatusOK
+	attempt.RequestID = strings.TrimSpace(resp.ID)
+	attempt.ProviderRequestID = strings.TrimSpace(resp.ID)
+	attempt.EndpointState.ResponseID = strings.TrimSpace(resp.ID)
+	attempt.Usage = buildProviderUsage(resp.Usage)
+	attempt.Cache = attempt.Usage.Cache
+	if len(resp.Choices) > 0 {
+		attempt.NativeFinishReason = resp.Choices[0].FinishReason
+		attempt.FinishReason = string(mapFinishReason(resp.Choices[0].FinishReason))
+	}
+}
+
+func errorClass(err error) string {
+	if err == nil {
+		return ""
+	}
+	if statusErr := (*openAIHTTPStatusError)(nil); errors.As(err, &statusErr) {
+		return "http_status"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "context_canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "deadline_exceeded"
+	}
+	name := fmt.Sprintf("%T", err)
+	if strings.HasPrefix(name, "*") {
+		name = strings.TrimPrefix(name, "*")
+	}
+	return name
 }
 
 // extractReasoningParts extracts reasoning/thought content from provider-specific payloads.

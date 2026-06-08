@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 
@@ -14,12 +15,16 @@ import (
 
 	"github.com/cpunion/ailib/adk/model/codexauth"
 	"github.com/cpunion/ailib/adk/model/openai"
+	providercontract "github.com/cpunion/ailib/adk/model/provider"
 )
 
 // Provider constants.
 const (
 	ProviderOpenRouter = "openrouter"
 	ProviderOpenAI     = "openai"
+	ProviderDeepSeek   = "deepseek"
+	ProviderMiniMax    = "minimax"
+	ProviderGroq       = "groq"
 	ProviderCodex      = "codex"
 	ProviderGemini     = "gemini"
 	ProviderVertexAI   = "vertexai"
@@ -29,10 +34,12 @@ const (
 
 // Config holds model factory configuration.
 type Config struct {
-	Provider string
-	Model    string
-	APIKey   string
-	BaseURL  string
+	Provider    string
+	Model       string
+	APIKey      string
+	BaseURL     string
+	HTTPClient  *http.Client
+	AttemptSink providercontract.AttemptSink
 }
 
 // ParseModelString parses a model string with an optional provider prefix.
@@ -46,6 +53,9 @@ func ParseModelString(modelWithProvider string) (provider, model string) {
 		ProviderMockEcho,
 		ProviderOpenRouter,
 		ProviderOpenAI,
+		ProviderDeepSeek,
+		ProviderMiniMax,
+		ProviderGroq,
 		ProviderCodex,
 		ProviderGemini,
 		ProviderVertexAI,
@@ -69,6 +79,12 @@ func GetAPIKeyEnvVar(provider string) string {
 		return "OPENROUTER_API_KEY"
 	case ProviderOpenAI:
 		return "OPENAI_API_KEY"
+	case ProviderDeepSeek:
+		return "DEEPSEEK_API_KEY"
+	case ProviderMiniMax:
+		return "MINIMAX_API_KEY"
+	case ProviderGroq:
+		return "GROQ_API_KEY"
 	case ProviderCodex:
 		return "CODEX_API_KEY"
 	case ProviderGemini:
@@ -87,6 +103,12 @@ func GetBaseURLEnvVar(provider string) string {
 		return "OPENROUTER_BASE_URL"
 	case ProviderOpenAI:
 		return "OPENAI_BASE_URL"
+	case ProviderDeepSeek:
+		return "DEEPSEEK_BASE_URL"
+	case ProviderMiniMax:
+		return "MINIMAX_BASE_URL"
+	case ProviderGroq:
+		return "GROQ_BASE_URL"
 	case ProviderCodex:
 		return "CODEX_BASE_URL"
 	default:
@@ -101,6 +123,12 @@ func GetDefaultBaseURL(provider string) string {
 		return "https://openrouter.ai/api/v1"
 	case ProviderOpenAI:
 		return "https://api.openai.com/v1"
+	case ProviderDeepSeek:
+		return "https://api.deepseek.com/v1"
+	case ProviderMiniMax:
+		return "https://api.minimax.io/v1"
+	case ProviderGroq:
+		return "https://api.groq.com/openai/v1"
 	case ProviderCodex:
 		return codexauth.OpenAIBaseURL
 	case ProviderGemini:
@@ -120,7 +148,23 @@ func New(ctx context.Context, modelWithProvider string) (adkmodel.LLM, error) {
 // NewWith creates an LLM model based on the provider prefix in the model string.
 func NewWith(ctx context.Context, modelWithProvider, apiKey, baseURL string) (adkmodel.LLM, error) {
 	provider, modelName := ParseModelString(modelWithProvider)
+	return NewFromConfig(ctx, Config{
+		Provider: provider,
+		Model:    modelName,
+		APIKey:   apiKey,
+		BaseURL:  baseURL,
+	})
+}
 
+// NewFromConfig creates an LLM model from explicit configuration.
+func NewFromConfig(ctx context.Context, cfg Config) (adkmodel.LLM, error) {
+	provider := strings.TrimSpace(cfg.Provider)
+	modelName := strings.TrimSpace(cfg.Model)
+	if provider == "" {
+		provider, modelName = ParseModelString(modelName)
+	}
+	apiKey := strings.TrimSpace(cfg.APIKey)
+	baseURL := strings.TrimSpace(cfg.BaseURL)
 	if apiKey == "" && provider != ProviderCodex {
 		envVar := GetAPIKeyEnvVar(provider)
 		if envVar != "" {
@@ -145,14 +189,16 @@ func NewWith(ctx context.Context, modelWithProvider, apiKey, baseURL string) (ad
 		err error
 	)
 	switch provider {
-	case ProviderOpenRouter, ProviderOpenAI:
+	case ProviderOpenRouter, ProviderOpenAI, ProviderDeepSeek, ProviderMiniMax, ProviderGroq:
 		if apiKey == "" {
 			return nil, fmt.Errorf("API key required for %s provider (set %s)", provider, GetAPIKeyEnvVar(provider))
 		}
 		llm, err = openai.NewModel(ctx, modelName, &openai.ClientConfig{
-			APIKey:   apiKey,
-			BaseURL:  baseURL,
-			Provider: provider,
+			APIKey:      apiKey,
+			BaseURL:     baseURL,
+			Provider:    provider,
+			HTTPClient:  cfg.HTTPClient,
+			AttemptSink: cfg.AttemptSink,
 		})
 		if err != nil {
 			return nil, err
@@ -175,15 +221,19 @@ func NewWith(ctx context.Context, modelWithProvider, apiKey, baseURL string) (ad
 		}
 		if accountID != "" && strings.Contains(strings.TrimSpace(baseURL), "/backend-api/codex") {
 			llm, err = openai.NewCodexResponsesModel(ctx, modelName, &openai.ClientConfig{
-				APIKey:   apiKey,
-				BaseURL:  baseURL,
-				Provider: provider,
+				APIKey:      apiKey,
+				BaseURL:     baseURL,
+				Provider:    provider,
+				HTTPClient:  cfg.HTTPClient,
+				AttemptSink: cfg.AttemptSink,
 			}, accountID)
 		} else {
 			llm, err = openai.NewModel(ctx, modelName, &openai.ClientConfig{
-				APIKey:   apiKey,
-				BaseURL:  baseURL,
-				Provider: provider,
+				APIKey:      apiKey,
+				BaseURL:     baseURL,
+				Provider:    provider,
+				HTTPClient:  cfg.HTTPClient,
+				AttemptSink: cfg.AttemptSink,
 			})
 		}
 		if err != nil {

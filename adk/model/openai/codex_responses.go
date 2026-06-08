@@ -55,6 +55,9 @@ type codexResponsesTool struct {
 type codexResponsesEvent struct {
 	Type     string                    `json:"type"`
 	Delta    string                    `json:"delta,omitempty"`
+	Message  string                    `json:"message,omitempty"`
+	Code     string                    `json:"code,omitempty"`
+	Error    *codexResponsesError      `json:"error,omitempty"`
 	ItemID   string                    `json:"item_id,omitempty"`
 	Item     *codexResponsesOutputItem `json:"item,omitempty"`
 	Response *codexResponsesFinal      `json:"response,omitempty"`
@@ -95,6 +98,8 @@ type codexResponsesUsage struct {
 
 type codexResponsesError struct {
 	Message string `json:"message"`
+	Code    string `json:"code,omitempty"`
+	Type    string `json:"type,omitempty"`
 }
 
 type codexIncompleteReason struct {
@@ -284,8 +289,8 @@ func (m *codexResponsesModel) GenerateContent(ctx context.Context, req *model.LL
 					return
 				}
 			case "error":
-				if event.Response != nil && event.Response.Error != nil && strings.TrimSpace(event.Response.Error.Message) != "" {
-					yield(nil, fmt.Errorf("%s", strings.TrimSpace(event.Response.Error.Message)))
+				if msg := codexStreamErrorMessage(event); msg != "" {
+					yield(nil, fmt.Errorf("%s", msg))
 					return
 				}
 				yield(nil, fmt.Errorf("codex responses stream error"))
@@ -304,6 +309,55 @@ func (m *codexResponsesModel) GenerateContent(ctx context.Context, req *model.LL
 		}
 		yield(finalResp, nil)
 	}
+}
+
+func codexStreamErrorMessage(event codexResponsesEvent) string {
+	var parts []string
+	if msg := strings.TrimSpace(event.Message); msg != "" {
+		parts = append(parts, msg)
+	}
+	if code := strings.TrimSpace(event.Code); code != "" {
+		parts = append(parts, "code="+code)
+	}
+	appendErr := func(err *codexResponsesError) {
+		if err == nil {
+			return
+		}
+		if msg := strings.TrimSpace(err.Message); msg != "" {
+			parts = append(parts, msg)
+		}
+		if typ := strings.TrimSpace(err.Type); typ != "" {
+			parts = append(parts, "type="+typ)
+		}
+		if code := strings.TrimSpace(err.Code); code != "" {
+			parts = append(parts, "code="+code)
+		}
+	}
+	appendErr(event.Error)
+	if event.Response != nil {
+		appendErr(event.Response.Error)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(dedupeStrings(parts), "; ")
+}
+
+func dedupeStrings(in []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
 }
 
 func (m *codexResponsesModel) convertRequest(req *model.LLMRequest) (*codexResponsesRequest, error) {

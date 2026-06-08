@@ -24,6 +24,7 @@ import (
 	"strings"
 	"testing"
 
+	providercontract "github.com/cpunion/ailib/adk/model/provider"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"google.golang.org/adk/model"
@@ -247,6 +248,94 @@ func TestModel_Generate(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestModel_AttemptSinkRecordsContentNullAndCacheUsage(t *testing.T) {
+	response := openAIResponse{
+		ID:      "chatcmpl-content-null",
+		Object:  "chat.completion",
+		Created: 1234567890,
+		Model:   "test-model",
+		Choices: []openAIChoice{
+			{
+				Index: 0,
+				Message: &openAIMessage{
+					Role:    "assistant",
+					Content: nil,
+				},
+				FinishReason: "stop",
+			},
+		},
+		Usage: &openAIUsage{
+			PromptTokens:     100,
+			CompletionTokens: 4,
+			TotalTokens:      104,
+			PromptTokensDetails: &promptTokensDetails{
+				CachedTokens: 64,
+			},
+			CompletionTokensDetails: &completionTokensDetails{
+				ReasoningTokens: 2,
+			},
+		},
+	}
+	server := newTestServer(t, response)
+	defer server.Close()
+
+	var attempts []providercontract.ModelAttempt
+	llm, err := NewModel(context.Background(), "test-model", &ClientConfig{
+		APIKey:     "test-api-key",
+		BaseURL:    server.URL,
+		Provider:   "openrouter",
+		HTTPClient: server.Client(),
+		AttemptSink: providercontract.AttemptSinkFunc(func(attempt providercontract.ModelAttempt) {
+			attempts = append(attempts, attempt)
+		}),
+	})
+	if err != nil {
+		t.Fatalf("NewModel: %v", err)
+	}
+
+	var finalResp *model.LLMResponse
+	for resp, err := range llm.GenerateContent(context.Background(), &model.LLMRequest{Contents: genai.Text("hi")}, false) {
+		if err != nil {
+			t.Fatalf("GenerateContent: %v", err)
+		}
+		finalResp = resp
+	}
+	if finalResp == nil {
+		t.Fatal("expected final response")
+	}
+	if got := extractTextFromContent(finalResp.Content); got != " " {
+		t.Fatalf("content text = %q, want blank sentinel", got)
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("attempts len=%d, want 1", len(attempts))
+	}
+	attempt := attempts[0]
+	if attempt.Provider != "openrouter" {
+		t.Fatalf("provider=%q, want openrouter", attempt.Provider)
+	}
+	if attempt.EndpointKind != providercontract.EndpointKindChatCompletions {
+		t.Fatalf("endpoint=%q", attempt.EndpointKind)
+	}
+	if attempt.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200", attempt.StatusCode)
+	}
+	if attempt.RequestID != "chatcmpl-content-null" {
+		t.Fatalf("request id=%q", attempt.RequestID)
+	}
+	if attempt.NativeFinishReason != "stop" || attempt.FinishReason != string(genai.FinishReasonStop) {
+		t.Fatalf("finish native=%q normalized=%q", attempt.NativeFinishReason, attempt.FinishReason)
+	}
+	if attempt.Usage.InputTokens != 100 || attempt.Usage.OutputTokens != 4 || attempt.Usage.TotalTokens != 104 {
+		t.Fatalf("usage=%+v", attempt.Usage)
+	}
+	if attempt.Usage.Cache.ReadTokens != 64 || !attempt.Usage.Cache.Hit {
+		t.Fatalf("cache=%+v", attempt.Usage.Cache)
+	}
+	if attempt.Usage.ReasoningTokens != 2 {
+		t.Fatalf("reasoning tokens=%d, want 2", attempt.Usage.ReasoningTokens)
 	}
 }
 
@@ -1875,6 +1964,108 @@ func TestModel_StreamingWithReasoningContent(t *testing.T) {
 
 	if finalResp.UsageMetadata == nil {
 		t.Error("expected usage metadata in final response")
+	}
+}
+
+func TestModel_StreamingUsageOnlyChunkAfterFinish(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("expected http.Flusher")
+		}
+
+		chunks := []openAIResponse{
+			{
+				ID:    "chatcmpl-usage-final",
+				Model: "test-model",
+				Choices: []openAIChoice{
+					{
+						Index: 0,
+						Delta: &openAIMessage{
+							Content: "hello",
+						},
+					},
+				},
+			},
+			{
+				ID:    "chatcmpl-usage-final",
+				Model: "test-model",
+				Choices: []openAIChoice{
+					{
+						Index:        0,
+						Delta:        &openAIMessage{},
+						FinishReason: "stop",
+					},
+				},
+			},
+			{
+				ID:    "chatcmpl-usage-final",
+				Model: "test-model",
+				Usage: &openAIUsage{
+					PromptTokens:     10,
+					CompletionTokens: 5,
+					TotalTokens:      15,
+					PromptTokensDetails: &promptTokensDetails{
+						CachedTokens: 3,
+					},
+				},
+			},
+		}
+		for _, chunk := range chunks {
+			jsonData, _ := json.Marshal(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", jsonData)
+			flusher.Flush()
+		}
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	var attempts []providercontract.ModelAttempt
+	llm, err := NewModel(context.Background(), "test-model", &ClientConfig{
+		APIKey:     "test-api-key",
+		BaseURL:    server.URL,
+		Provider:   "openrouter",
+		HTTPClient: server.Client(),
+		AttemptSink: providercontract.AttemptSinkFunc(func(attempt providercontract.ModelAttempt) {
+			attempts = append(attempts, attempt)
+		}),
+	})
+	if err != nil {
+		t.Fatalf("NewModel: %v", err)
+	}
+
+	var finalResp *model.LLMResponse
+	for resp, err := range llm.GenerateContent(context.Background(), &model.LLMRequest{Contents: genai.Text("hi")}, true) {
+		if err != nil {
+			t.Fatalf("GenerateContent: %v", err)
+		}
+		if !resp.Partial {
+			finalResp = resp
+		}
+	}
+	if finalResp == nil {
+		t.Fatal("expected final response")
+	}
+	if got := extractTextFromContent(finalResp.Content); got != "hello" {
+		t.Fatalf("final text=%q, want hello", got)
+	}
+	if finalResp.UsageMetadata == nil || finalResp.UsageMetadata.TotalTokenCount != 15 || finalResp.UsageMetadata.CachedContentTokenCount != 3 {
+		t.Fatalf("usage metadata=%+v", finalResp.UsageMetadata)
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("attempts len=%d, want 1", len(attempts))
+	}
+	attempt := attempts[0]
+	if attempt.StreamChunkCount != 3 {
+		t.Fatalf("stream chunks=%d, want 3", attempt.StreamChunkCount)
+	}
+	if attempt.NativeFinishReason != "stop" {
+		t.Fatalf("native finish=%q, want stop", attempt.NativeFinishReason)
+	}
+	if attempt.Usage.TotalTokens != 15 || attempt.Usage.Cache.ReadTokens != 3 {
+		t.Fatalf("attempt usage=%+v", attempt.Usage)
 	}
 }
 
