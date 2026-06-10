@@ -50,6 +50,9 @@ type ClientConfig struct {
 	HTTPClient *http.Client
 	// AttemptSink observes normalized provider attempts (optional).
 	AttemptSink providercontract.AttemptSink
+	// PromptCacheKey is sent as prompt_cache_key on OpenAI-compatible chat
+	// completion requests when non-empty.
+	PromptCacheKey string
 }
 
 // openAIModel implements the model.LLM interface for OpenAI-compatible APIs.
@@ -138,6 +141,7 @@ type openAIRequest struct {
 	Stop            []string              `json:"stop,omitempty"`
 	Stream          bool                  `json:"stream,omitempty"`
 	ResponseFormat  *openAIResponseFormat `json:"response_format,omitempty"`
+	PromptCacheKey  string                `json:"prompt_cache_key,omitempty"`
 }
 
 type openAIResponseFormat struct {
@@ -210,8 +214,9 @@ type completionTokensDetails struct {
 // convertRequest converts a model.LLMRequest to OpenAI format
 func (m *openAIModel) convertRequest(req *model.LLMRequest) (*openAIRequest, error) {
 	openaiReq := &openAIRequest{
-		Model:    m.modelName,
-		Messages: make([]openAIMessage, 0),
+		Model:          m.modelName,
+		Messages:       make([]openAIMessage, 0),
+		PromptCacheKey: strings.TrimSpace(m.config.PromptCacheKey),
 	}
 
 	// Add system instruction if present.
@@ -712,7 +717,7 @@ func (m *openAIModel) generateStream(ctx context.Context, openaiReq *openAIReque
 			attempt.FailureReason = providercontract.ClassifyError(err)
 			attempt.ErrorClass = errorClass(err)
 			attempt.Usage = buildProviderUsage(usage)
-			attempt.Cache = attempt.Usage.Cache
+			applyRequestCacheKey(&attempt)
 			m.observeAttempt(attempt, start)
 			yield(nil, fmt.Errorf("stream error: %w", err))
 			return
@@ -732,7 +737,7 @@ func (m *openAIModel) generateStream(ctx context.Context, openaiReq *openAIReque
 			attempt.NativeFinishReason = nativeFinishReason
 			attempt.FinishReason = string(mapFinishReason(finishReason))
 			attempt.Usage = buildProviderUsage(usage)
-			attempt.Cache = attempt.Usage.Cache
+			applyRequestCacheKey(&attempt)
 			if !firstTokenAt.IsZero() {
 				attempt.TimeToFirstTokenMS = firstTokenAt.Sub(start).Milliseconds()
 			}
@@ -969,6 +974,9 @@ func (m *openAIModel) newAttempt() providercontract.ModelAttempt {
 		Model:        m.modelName,
 		EndpointKind: providercontract.EndpointKindChatCompletions,
 		BaseURLClass: providercontract.BaseURLClass(m.config.BaseURL),
+		Cache: providercontract.CacheUsage{
+			CacheKey: strings.TrimSpace(m.config.PromptCacheKey),
+		},
 	}
 }
 
@@ -991,11 +999,21 @@ func applyOpenAIResponseAttempt(attempt *providercontract.ModelAttempt, resp *op
 	attempt.ProviderRequestID = strings.TrimSpace(resp.ID)
 	attempt.EndpointState.ResponseID = strings.TrimSpace(resp.ID)
 	attempt.Usage = buildProviderUsage(resp.Usage)
-	attempt.Cache = attempt.Usage.Cache
+	applyRequestCacheKey(attempt)
 	if len(resp.Choices) > 0 {
 		attempt.NativeFinishReason = resp.Choices[0].FinishReason
 		attempt.FinishReason = string(mapFinishReason(resp.Choices[0].FinishReason))
 	}
+}
+
+func applyRequestCacheKey(attempt *providercontract.ModelAttempt) {
+	if attempt == nil {
+		return
+	}
+	if key := strings.TrimSpace(attempt.Cache.CacheKey); key != "" {
+		attempt.Usage.Cache.CacheKey = key
+	}
+	attempt.Cache = attempt.Usage.Cache
 }
 
 func errorClass(err error) string {

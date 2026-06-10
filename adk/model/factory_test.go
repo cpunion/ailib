@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -96,6 +97,40 @@ func TestNewFromConfigOpenAICompatibleAcceptsAttemptSink(t *testing.T) {
 	}
 	if len(attempts) != 0 {
 		t.Fatalf("attempts should only be observed during generation, got %d", len(attempts))
+	}
+}
+
+func TestNewFromConfigOpenAICompatibleForwardsPromptCacheKey(t *testing.T) {
+	var gotBody map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-cache","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer ts.Close()
+
+	llm, err := NewFromConfig(context.Background(), Config{
+		Provider:       ProviderOpenAI,
+		Model:          "gpt-test",
+		APIKey:         "sk-test",
+		BaseURL:        ts.URL,
+		HTTPClient:     ts.Client(),
+		PromptCacheKey: "aos:tool-manifest:def456",
+	})
+	if err != nil {
+		t.Fatalf("NewFromConfig: %v", err)
+	}
+	for _, err := range llm.GenerateContent(context.Background(), &adkmodel.LLMRequest{
+		Contents: []*genai.Content{genai.NewContentFromText("hi", genai.RoleUser)},
+	}, false) {
+		if err != nil {
+			t.Fatalf("GenerateContent: %v", err)
+		}
+	}
+	if gotBody["prompt_cache_key"] != "aos:tool-manifest:def456" {
+		t.Fatalf("prompt_cache_key=%v body=%+v", gotBody["prompt_cache_key"], gotBody)
 	}
 }
 

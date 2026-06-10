@@ -339,6 +339,58 @@ func TestModel_AttemptSinkRecordsContentNullAndCacheUsage(t *testing.T) {
 	}
 }
 
+func TestModel_ForwardsPromptCacheKey(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(openAIResponse{
+			ID:     "chatcmpl-cache-key",
+			Object: "chat.completion",
+			Model:  "test-model",
+			Choices: []openAIChoice{{
+				Index:        0,
+				Message:      &openAIMessage{Role: "assistant", Content: "ok"},
+				FinishReason: "stop",
+			}},
+			Usage: &openAIUsage{
+				PromptTokens:     3,
+				CompletionTokens: 1,
+				TotalTokens:      4,
+			},
+		})
+	}))
+	defer server.Close()
+
+	var attempts []providercontract.ModelAttempt
+	llm, err := NewModel(context.Background(), "test-model", &ClientConfig{
+		APIKey:         "test-api-key",
+		BaseURL:        server.URL,
+		Provider:       "openai",
+		HTTPClient:     server.Client(),
+		PromptCacheKey: "aos:tool-manifest:abc123",
+		AttemptSink: providercontract.AttemptSinkFunc(func(attempt providercontract.ModelAttempt) {
+			attempts = append(attempts, attempt)
+		}),
+	})
+	if err != nil {
+		t.Fatalf("NewModel: %v", err)
+	}
+	for _, err := range llm.GenerateContent(context.Background(), &model.LLMRequest{Contents: genai.Text("hi")}, false) {
+		if err != nil {
+			t.Fatalf("GenerateContent: %v", err)
+		}
+	}
+	if gotBody["prompt_cache_key"] != "aos:tool-manifest:abc123" {
+		t.Fatalf("prompt_cache_key=%v body=%+v", gotBody["prompt_cache_key"], gotBody)
+	}
+	if len(attempts) != 1 || attempts[0].Cache.CacheKey != "aos:tool-manifest:abc123" || attempts[0].Usage.Cache.CacheKey != "aos:tool-manifest:abc123" {
+		t.Fatalf("attempts=%+v", attempts)
+	}
+}
+
 func TestModel_GenerateStream(t *testing.T) {
 	tests := []struct {
 		name    string

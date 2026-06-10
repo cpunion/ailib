@@ -40,6 +40,9 @@ type Config struct {
 	BaseURL     string
 	HTTPClient  *http.Client
 	AttemptSink providercontract.AttemptSink
+	// PromptCacheKey is forwarded to providers that expose a native prompt cache
+	// bucketing key, such as OpenAI-compatible prompt_cache_key.
+	PromptCacheKey string
 }
 
 // ParseModelString parses a model string with an optional provider prefix.
@@ -195,11 +198,12 @@ func NewFromConfig(ctx context.Context, cfg Config) (adkmodel.LLM, error) {
 			return nil, fmt.Errorf("API key required for %s provider (set %s)", provider, GetAPIKeyEnvVar(provider))
 		}
 		llm, err = openai.NewModel(ctx, modelName, &openai.ClientConfig{
-			APIKey:      apiKey,
-			BaseURL:     baseURL,
-			Provider:    provider,
-			HTTPClient:  cfg.HTTPClient,
-			AttemptSink: cfg.AttemptSink,
+			APIKey:         apiKey,
+			BaseURL:        baseURL,
+			Provider:       provider,
+			HTTPClient:     cfg.HTTPClient,
+			AttemptSink:    cfg.AttemptSink,
+			PromptCacheKey: cfg.PromptCacheKey,
 		})
 		if err != nil {
 			return nil, err
@@ -236,11 +240,12 @@ func NewFromConfig(ctx context.Context, cfg Config) (adkmodel.LLM, error) {
 			}, accountID)
 		} else {
 			llm, err = openai.NewModel(ctx, modelName, &openai.ClientConfig{
-				APIKey:      apiKey,
-				BaseURL:     baseURL,
-				Provider:    provider,
-				HTTPClient:  cfg.HTTPClient,
-				AttemptSink: cfg.AttemptSink,
+				APIKey:         apiKey,
+				BaseURL:        baseURL,
+				Provider:       provider,
+				HTTPClient:     cfg.HTTPClient,
+				AttemptSink:    cfg.AttemptSink,
+				PromptCacheKey: cfg.PromptCacheKey,
 			})
 		}
 		if err != nil {
