@@ -122,6 +122,11 @@ func (m *openAIModel) GenerateContent(ctx context.Context, req *model.LLMRequest
 			yield(nil, fmt.Errorf("failed to convert request: %w", err))
 		}
 	}
+	// Request-scoped prompt cache key wins over the client-level default:
+	// clients are shared across sessions, cache bucketing is per session.
+	if key := providercontract.PromptCacheKeyFromContext(ctx); key != "" {
+		openaiReq.PromptCacheKey = key
+	}
 
 	if stream {
 		return m.generateStream(ctx, openaiReq)

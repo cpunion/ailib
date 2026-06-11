@@ -2638,3 +2638,44 @@ func float32Ptr(f float32) *float32 {
 func intPtr(i int) *int {
 	return &i
 }
+
+func TestModel_ContextPromptCacheKeyOverridesClientDefault(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(openAIResponse{
+			ID:     "chatcmpl-cache-key-ctx",
+			Object: "chat.completion",
+			Model:  "test-model",
+			Choices: []openAIChoice{{
+				Index:        0,
+				Message:      &openAIMessage{Role: "assistant", Content: "ok"},
+				FinishReason: "stop",
+			}},
+		})
+	}))
+	defer server.Close()
+
+	llm, err := NewModel(context.Background(), "test-model", &ClientConfig{
+		APIKey:         "test-api-key",
+		BaseURL:        server.URL,
+		Provider:       "openai",
+		HTTPClient:     server.Client(),
+		PromptCacheKey: "client-default",
+	})
+	if err != nil {
+		t.Fatalf("NewModel: %v", err)
+	}
+	ctx := providercontract.WithPromptCacheKey(context.Background(), "aos:session:s-1")
+	for _, err := range llm.GenerateContent(ctx, &model.LLMRequest{Contents: genai.Text("hi")}, false) {
+		if err != nil {
+			t.Fatalf("GenerateContent: %v", err)
+		}
+	}
+	if gotBody["prompt_cache_key"] != "aos:session:s-1" {
+		t.Fatalf("request-scoped key should win: prompt_cache_key=%v", gotBody["prompt_cache_key"])
+	}
+}
