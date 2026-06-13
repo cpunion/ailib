@@ -170,29 +170,7 @@ func (m *codexResponsesModel) GenerateContent(ctx context.Context, req *model.LL
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(make([]byte, 0, 64*1024), 4<<20)
 
-		var (
-			textBuilder strings.Builder
-			calls       []*codexResponseCall
-			callsByID   = map[string]*codexResponseCall{}
-			images      []*genai.Blob
-			seenImages  = map[string]struct{}{}
-			usage       *genai.GenerateContentResponseUsageMetadata
-			finish      = genai.FinishReasonStop
-		)
-
-		ensureCall := func(itemID string) *codexResponseCall {
-			if itemID == "" {
-				itemID = "call_" + uuid.NewString()[:8]
-			}
-			if existing := callsByID[itemID]; existing != nil {
-				return existing
-			}
-			call := &codexResponseCall{itemID: itemID}
-			callsByID[itemID] = call
-			calls = append(calls, call)
-			return call
-		}
-
+		acc := newResponsesAccumulator()
 		for scanner.Scan() {
 			line := scanner.Text()
 			if !strings.HasPrefix(line, "data: ") {
@@ -208,113 +186,23 @@ func (m *codexResponsesModel) GenerateContent(ctx context.Context, req *model.LL
 				continue
 			}
 
-			switch event.Type {
-			case "response.output_text.delta":
-				if event.Delta == "" {
-					continue
-				}
-				textBuilder.WriteString(event.Delta)
-				if stream {
-					if !yield(&model.LLMResponse{
-						Content: &genai.Content{
-							Role: "model",
-							Parts: []*genai.Part{
-								{Text: event.Delta},
-							},
-						},
-						Partial: true,
-					}, nil) {
-						return
-					}
-				}
-			case "response.function_call_arguments.delta":
-				call := ensureCall(event.ItemID)
-				call.arguments.WriteString(event.Delta)
-			case "response.output_item.added", "response.output_item.done":
-				if event.Item == nil {
-					continue
-				}
-				switch event.Item.Type {
-				case "function_call":
-					call := ensureCall(firstNonEmptyString(event.Item.ID, event.Item.CallID, event.ItemID))
-					if strings.TrimSpace(event.Item.CallID) != "" {
-						call.callID = strings.TrimSpace(event.Item.CallID)
-					}
-					if strings.TrimSpace(event.Item.Name) != "" {
-						call.name = strings.TrimSpace(event.Item.Name)
-					}
-					if strings.TrimSpace(event.Item.Arguments) != "" {
-						call.arguments.Reset()
-						call.arguments.WriteString(strings.TrimSpace(event.Item.Arguments))
-					}
-				case "message":
-					if textBuilder.Len() == 0 {
-						for _, part := range event.Item.Content {
-							if strings.EqualFold(strings.TrimSpace(part.Type), "output_text") && part.Text != "" {
-								textBuilder.WriteString(part.Text)
-							}
-						}
-					}
-				case "image_generation_call":
-					itemID := firstNonEmptyString(event.Item.ID, event.Item.CallID, event.ItemID)
-					if event.Type != "response.output_item.done" || strings.TrimSpace(event.Item.Result) == "" {
-						continue
-					}
-					if _, exists := seenImages[itemID]; exists {
-						continue
-					}
-					imageData, err := base64.StdEncoding.DecodeString(strings.TrimSpace(event.Item.Result))
-					if err != nil {
-						err = fmt.Errorf("failed to decode codex image output: %w", err)
-						m.applyErrorAttempt(&attempt, err)
-						m.observeAttempt(attempt, start)
-						yield(nil, err)
-						return
-					}
-					images = append(images, &genai.Blob{
-						MIMEType: detectCodexImageMimeType(imageData),
-						Data:     imageData,
-					})
-					seenImages[itemID] = struct{}{}
-				}
-			case "response.completed":
-				if event.Response == nil {
-					continue
-				}
-				usage = buildCodexUsageMetadata(event.Response.Usage)
-				switch strings.ToLower(strings.TrimSpace(event.Response.Status)) {
-				case "completed", "":
-					finish = genai.FinishReasonStop
-				case "incomplete":
-					if event.Response.IncompleteDetails != nil && strings.EqualFold(strings.TrimSpace(event.Response.IncompleteDetails.Reason), "max_output_tokens") {
-						finish = genai.FinishReasonMaxTokens
-					} else {
-						finish = genai.FinishReasonOther
-					}
-				default:
-					message := "codex response failed"
-					if event.Response.Error != nil && strings.TrimSpace(event.Response.Error.Message) != "" {
-						message = strings.TrimSpace(event.Response.Error.Message)
-					}
-					err := fmt.Errorf("%s", message)
-					m.applyErrorAttempt(&attempt, err)
-					m.observeAttempt(attempt, start)
-					yield(nil, err)
-					return
-				}
-			case "error":
-				if msg := codexStreamErrorMessage(event); msg != "" {
-					err := fmt.Errorf("%s", msg)
-					m.applyErrorAttempt(&attempt, err)
-					m.observeAttempt(attempt, start)
-					yield(nil, err)
-					return
-				}
-				err := fmt.Errorf("codex responses stream error")
-				m.applyErrorAttempt(&attempt, err)
+			delta, evErr := acc.handleEvent(event)
+			if evErr != nil {
+				m.applyErrorAttempt(&attempt, evErr)
 				m.observeAttempt(attempt, start)
-				yield(nil, err)
+				yield(nil, evErr)
 				return
+			}
+			if delta != "" && stream {
+				if !yield(&model.LLMResponse{
+					Content: &genai.Content{
+						Role:  "model",
+						Parts: []*genai.Part{{Text: delta}},
+					},
+					Partial: true,
+				}, nil) {
+					return
+				}
 			}
 		}
 		if err := scanner.Err(); err != nil {
@@ -325,14 +213,14 @@ func (m *codexResponsesModel) GenerateContent(ctx context.Context, req *model.LL
 			return
 		}
 
-		finalResp, err := buildCodexFinalResponse(textBuilder.String(), images, calls, usage, finish)
+		finalResp, err := buildCodexFinalResponse(acc.textBuilder.String(), acc.images, acc.calls, acc.usage, acc.finish)
 		if err != nil {
 			m.applyErrorAttempt(&attempt, err)
 			m.observeAttempt(attempt, start)
 			yield(nil, err)
 			return
 		}
-		applyCodexSuccessAttempt(&attempt, usage, finish, m.accountID)
+		applyCodexSuccessAttempt(&attempt, acc.usage, acc.finish, m.accountID)
 		m.observeAttempt(attempt, start)
 		yield(finalResp, nil)
 	}
@@ -405,7 +293,7 @@ func (m *codexResponsesModel) convertRequest(req *model.LLMRequest) (*codexRespo
 	}
 
 	for _, content := range req.Contents {
-		items, err := convertCodexInputContent(content)
+		items, err := convertResponsesInputContent(content)
 		if err != nil {
 			return nil, err
 		}
@@ -439,7 +327,10 @@ func (m *codexResponsesModel) convertRequest(req *model.LLMRequest) (*codexRespo
 	return out, nil
 }
 
-func convertCodexInputContent(content *genai.Content) ([]any, error) {
+// convertResponsesInputContent maps a genai.Content into OpenAI Responses API
+// input items (message / function_call / function_call_output). It is shared by
+// the Codex backend and the generic /v1/responses model.
+func convertResponsesInputContent(content *genai.Content) ([]any, error) {
 	if content == nil || len(content.Parts) == 0 {
 		return nil, nil
 	}
