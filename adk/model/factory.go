@@ -43,6 +43,11 @@ type Config struct {
 	// PromptCacheKey is forwarded to providers that expose a native prompt cache
 	// bucketing key, such as OpenAI-compatible prompt_cache_key.
 	PromptCacheKey string
+	// EndpointKind optionally selects the provider API shape for OpenAI-compatible
+	// providers. The zero value (and EndpointKindChatCompletions) uses
+	// /chat/completions; EndpointKindResponses routes to the /v1/responses model.
+	// Other providers ignore this field.
+	EndpointKind providercontract.EndpointKind
 }
 
 // ParseModelString parses a model string with an optional provider prefix.
@@ -197,14 +202,19 @@ func NewFromConfig(ctx context.Context, cfg Config) (adkmodel.LLM, error) {
 		if apiKey == "" {
 			return nil, fmt.Errorf("API key required for %s provider (set %s)", provider, GetAPIKeyEnvVar(provider))
 		}
-		llm, err = openai.NewModel(ctx, modelName, &openai.ClientConfig{
+		clientCfg := &openai.ClientConfig{
 			APIKey:         apiKey,
 			BaseURL:        baseURL,
 			Provider:       provider,
 			HTTPClient:     cfg.HTTPClient,
 			AttemptSink:    cfg.AttemptSink,
 			PromptCacheKey: cfg.PromptCacheKey,
-		})
+		}
+		if cfg.EndpointKind == providercontract.EndpointKindResponses {
+			llm, err = openai.NewResponsesModel(ctx, modelName, clientCfg)
+		} else {
+			llm, err = openai.NewModel(ctx, modelName, clientCfg)
+		}
 		if err != nil {
 			return nil, err
 		}

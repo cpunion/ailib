@@ -134,6 +134,70 @@ func TestNewFromConfigOpenAICompatibleForwardsPromptCacheKey(t *testing.T) {
 	}
 }
 
+func TestNewFromConfigEndpointKindRoutesToResponses(t *testing.T) {
+	var path string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"))
+	}))
+	defer ts.Close()
+
+	llm, err := NewFromConfig(context.Background(), Config{
+		Provider:     ProviderOpenAI,
+		Model:        "gpt-test",
+		APIKey:       "sk-test",
+		BaseURL:      ts.URL,
+		HTTPClient:   ts.Client(),
+		EndpointKind: providercontract.EndpointKindResponses,
+	})
+	if err != nil {
+		t.Fatalf("NewFromConfig: %v", err)
+	}
+	for _, err := range llm.GenerateContent(context.Background(), &adkmodel.LLMRequest{
+		Contents: []*genai.Content{genai.NewContentFromText("hi", genai.RoleUser)},
+	}, false) {
+		if err != nil {
+			t.Fatalf("GenerateContent: %v", err)
+		}
+	}
+	if path != "/responses" {
+		t.Fatalf("EndpointKindResponses must hit /responses, got %q", path)
+	}
+}
+
+func TestNewFromConfigDefaultRoutesToChatCompletions(t *testing.T) {
+	var path string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer ts.Close()
+
+	llm, err := NewFromConfig(context.Background(), Config{
+		Provider:   ProviderOpenAI,
+		Model:      "gpt-test",
+		APIKey:     "sk-test",
+		BaseURL:    ts.URL,
+		HTTPClient: ts.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewFromConfig: %v", err)
+	}
+	for _, err := range llm.GenerateContent(context.Background(), &adkmodel.LLMRequest{
+		Contents: []*genai.Content{genai.NewContentFromText("hi", genai.RoleUser)},
+	}, false) {
+		if err != nil {
+			t.Fatalf("GenerateContent: %v", err)
+		}
+	}
+	if path != "/chat/completions" {
+		t.Fatalf("default must hit /chat/completions, got %q", path)
+	}
+}
+
 func TestNewFromConfigCodexPrefersExplicitAPIKeyAccountID(t *testing.T) {
 	const explicitToken = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF9leHBsaWNpdCJ9fQ."
 	const envToken = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF9lbnYifX0."
