@@ -202,9 +202,21 @@ func TestNewFromConfigCodexPrefersExplicitAPIKeyAccountID(t *testing.T) {
 	const explicitToken = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF9leHBsaWNpdCJ9fQ."
 	const envToken = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF9lbnYifX0."
 
-	var seenAccount string
+	var (
+		seenAccount string
+		seenEffort  string
+	)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenAccount = r.Header.Get("chatgpt-account-id")
+		var request struct {
+			Reasoning struct {
+				Effort string `json:"effort"`
+			} `json:"reasoning"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		seenEffort = request.Reasoning.Effort
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n"))
 		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"))
@@ -213,11 +225,12 @@ func TestNewFromConfigCodexPrefersExplicitAPIKeyAccountID(t *testing.T) {
 
 	t.Setenv("CODEX_API_KEY", envToken)
 	llm, err := NewFromConfig(context.Background(), Config{
-		Provider:   ProviderCodex,
-		Model:      "gpt-5.4-mini",
-		APIKey:     explicitToken,
-		BaseURL:    ts.URL + "/backend-api/codex",
-		HTTPClient: ts.Client(),
+		Provider:        ProviderCodex,
+		Model:           "gpt-5.4-mini",
+		APIKey:          explicitToken,
+		BaseURL:         ts.URL + "/backend-api/codex",
+		HTTPClient:      ts.Client(),
+		ReasoningEffort: "xhigh",
 	})
 	if err != nil {
 		t.Fatalf("NewFromConfig: %v", err)
@@ -231,5 +244,8 @@ func TestNewFromConfigCodexPrefersExplicitAPIKeyAccountID(t *testing.T) {
 	}
 	if seenAccount != "acct_explicit" {
 		t.Fatalf("account=%q", seenAccount)
+	}
+	if seenEffort != "xhigh" {
+		t.Fatalf("reasoning effort=%q", seenEffort)
 	}
 }

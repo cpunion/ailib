@@ -178,7 +178,7 @@ func (m *responsesModel) GenerateContent(ctx context.Context, req *model.LLMRequ
 			yield(nil, err)
 			return
 		}
-		m.applySuccessAttempt(&attempt, acc.usage, acc.finish)
+		m.applySuccessAttempt(&attempt, acc.usage, acc.finish, acc.responseID)
 		m.observeAttempt(attempt, start)
 		yield(finalResp, nil)
 	}
@@ -291,7 +291,12 @@ func (m *responsesModel) applyErrorAttempt(attempt *providercontract.ModelAttemp
 	}
 }
 
-func (m *responsesModel) applySuccessAttempt(attempt *providercontract.ModelAttempt, usage *genai.GenerateContentResponseUsageMetadata, finish genai.FinishReason) {
+func (m *responsesModel) applySuccessAttempt(
+	attempt *providercontract.ModelAttempt,
+	usage *genai.GenerateContentResponseUsageMetadata,
+	finish genai.FinishReason,
+	responseID string,
+) {
 	if attempt == nil {
 		return
 	}
@@ -311,6 +316,8 @@ func (m *responsesModel) applySuccessAttempt(attempt *providercontract.ModelAtte
 		}
 	}
 	attempt.Cache = attempt.Usage.Cache
+	attempt.RequestID = strings.TrimSpace(responseID)
+	attempt.ProviderRequestID = strings.TrimSpace(responseID)
 }
 
 func (m *responsesModel) observeAttempt(attempt providercontract.ModelAttempt, start time.Time) {

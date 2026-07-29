@@ -53,6 +53,14 @@ type ClientConfig struct {
 	// PromptCacheKey is sent as prompt_cache_key on OpenAI-compatible chat
 	// completion requests when non-empty.
 	PromptCacheKey string
+	// ReasoningEffort configures Codex/OpenAI Responses reasoning without
+	// embedding transport configuration in the model-visible system prompt.
+	ReasoningEffort string
+	// ReasoningSummary controls the Codex reasoning summary. Empty defaults to
+	// "auto" when ReasoningEffort is set.
+	ReasoningSummary string
+	// TextVerbosity controls Codex response verbosity. Empty defaults to "low".
+	TextVerbosity string
 }
 
 // openAIModel implements the model.LLM interface for OpenAI-compatible APIs.

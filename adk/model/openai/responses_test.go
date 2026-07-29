@@ -51,7 +51,7 @@ func TestResponsesModelGenerateText(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n"))
 		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\" world\"}\n\n"))
-		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":5,\"total_tokens\":17,\"input_tokens_details\":{\"cached_tokens\":4}}}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-openai-123\",\"model\":\"gpt-5.4-mini\",\"status\":\"completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":5,\"total_tokens\":17,\"input_tokens_details\":{\"cached_tokens\":4}}}}\n\n"))
 	}))
 	defer ts.Close()
 
@@ -112,6 +112,10 @@ func TestResponsesModelGenerateText(t *testing.T) {
 	a := attempts[0]
 	if a.Provider != "openai" || a.EndpointKind != providercontract.EndpointKindResponses {
 		t.Fatalf("attempt provider/kind=%+v", a)
+	}
+	if a.RequestID != "resp-openai-123" ||
+		a.ProviderRequestID != "resp-openai-123" {
+		t.Fatalf("attempt request identity=%+v", a)
 	}
 	if a.StatusCode != http.StatusOK || a.Usage.TotalTokens != 17 || a.Usage.Cache.ReadTokens != 4 || !a.Usage.Cache.Hit {
 		t.Fatalf("attempt=%+v", a)

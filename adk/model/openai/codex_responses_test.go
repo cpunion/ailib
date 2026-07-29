@@ -25,6 +25,15 @@ func TestCodexResponsesModelGenerateText(t *testing.T) {
 		seenStream    bool
 		seenPrompt    string
 		seenInput     []any
+		seenReasoning codexResponsesReasoning
+		seenText      codexResponsesText
+		seenInclude   []string
+		seenParallel  bool
+		seenCacheKey  string
+		seenBeta      string
+		seenOrigin    string
+		seenSession   string
+		seenMaxTokens int
 		attempts      []providercontract.ModelAttempt
 	)
 
@@ -37,11 +46,17 @@ func TestCodexResponsesModelGenerateText(t *testing.T) {
 			t.Fatalf("ReadAll: %v", err)
 		}
 		var req struct {
-			Model        string `json:"model"`
-			Store        bool   `json:"store"`
-			Stream       bool   `json:"stream"`
-			Instructions string `json:"instructions"`
-			Input        []any  `json:"input"`
+			Model        string                  `json:"model"`
+			Store        bool                    `json:"store"`
+			Stream       bool                    `json:"stream"`
+			Instructions string                  `json:"instructions"`
+			Input        []any                   `json:"input"`
+			Reasoning    codexResponsesReasoning `json:"reasoning"`
+			Text         codexResponsesText      `json:"text"`
+			Include      []string                `json:"include"`
+			Parallel     bool                    `json:"parallel_tool_calls"`
+			CacheKey     string                  `json:"prompt_cache_key"`
+			MaxTokens    int                     `json:"max_output_tokens"`
 		}
 		if err := json.Unmarshal(raw, &req); err != nil {
 			t.Fatalf("Unmarshal: %v", err)
@@ -53,20 +68,33 @@ func TestCodexResponsesModelGenerateText(t *testing.T) {
 		seenStream = req.Stream
 		seenPrompt = req.Instructions
 		seenInput = req.Input
+		seenReasoning = req.Reasoning
+		seenText = req.Text
+		seenInclude = req.Include
+		seenParallel = req.Parallel
+		seenCacheKey = req.CacheKey
+		seenBeta = r.Header.Get("OpenAI-Beta")
+		seenOrigin = r.Header.Get("originator")
+		seenSession = r.Header.Get("session-id")
+		seenMaxTokens = req.MaxTokens
 
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"type\":\"response.created\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-codex-123\",\"model\":\"gpt-5.4-mini\",\"status\":\"in_progress\"}}\n\n"))
 		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n"))
 		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\" world\"}\n\n"))
-		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":5,\"total_tokens\":17}}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-codex-123\",\"model\":\"gpt-5.4-mini\",\"status\":\"completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":5,\"total_tokens\":17}}}\n\n"))
 	}))
 	defer ts.Close()
 
 	llm, err := NewCodexResponsesModel(context.Background(), "gpt-5.4-mini", &ClientConfig{
-		APIKey:     "jwt-token",
-		BaseURL:    ts.URL,
-		HTTPClient: ts.Client(),
-		Provider:   "codex",
+		APIKey:           "jwt-token",
+		BaseURL:          ts.URL,
+		HTTPClient:       ts.Client(),
+		Provider:         "codex",
+		PromptCacheKey:   strings.Repeat("s", 70),
+		ReasoningEffort:  "xhigh",
+		ReasoningSummary: "auto",
+		TextVerbosity:    "low",
 		AttemptSink: providercontract.AttemptSinkFunc(func(attempt providercontract.ModelAttempt) {
 			attempts = append(attempts, attempt)
 		}),
@@ -80,7 +108,8 @@ func TestCodexResponsesModelGenerateText(t *testing.T) {
 			genai.NewContentFromText("Say hello.", genai.RoleUser),
 		},
 		Config: &genai.GenerateContentConfig{
-			SystemInstruction: genai.NewContentFromText("Runtime: repo=/workspace | thinking=xhigh", "system"),
+			SystemInstruction: genai.NewContentFromText("Evaluation instructions.", "system"),
+			MaxOutputTokens:   6000,
 		},
 	}
 	responses, err := collectResponses(llm.GenerateContent(context.Background(), req, false))
@@ -109,8 +138,27 @@ func TestCodexResponsesModelGenerateText(t *testing.T) {
 	if !seenStream {
 		t.Fatalf("stream should be true")
 	}
-	if !strings.Contains(seenPrompt, "thinking=xhigh") {
+	if seenPrompt != "Evaluation instructions." {
 		t.Fatalf("instructions=%q", seenPrompt)
+	}
+	if seenReasoning.Effort != "xhigh" || seenReasoning.Summary != "auto" {
+		t.Fatalf("reasoning=%+v", seenReasoning)
+	}
+	if seenText.Verbosity != "low" {
+		t.Fatalf("text=%+v", seenText)
+	}
+	if len(seenInclude) != 1 || seenInclude[0] != "reasoning.encrypted_content" {
+		t.Fatalf("include=%v", seenInclude)
+	}
+	wantSession := strings.Repeat("s", codexSessionIDMaxRunes)
+	if !seenParallel || seenCacheKey != wantSession {
+		t.Fatalf("parallel=%t cacheKey=%q", seenParallel, seenCacheKey)
+	}
+	if seenMaxTokens != 6000 {
+		t.Fatalf("max output tokens=%d", seenMaxTokens)
+	}
+	if seenBeta != "responses=experimental" || seenOrigin != "ailib" || seenSession != wantSession {
+		t.Fatalf("headers beta=%q origin=%q session=%q", seenBeta, seenOrigin, seenSession)
 	}
 	if len(seenInput) != 1 {
 		t.Fatalf("input items=%d", len(seenInput))
@@ -124,6 +172,10 @@ func TestCodexResponsesModelGenerateText(t *testing.T) {
 	}
 	if attempt.StatusCode != http.StatusOK || attempt.Usage.TotalTokens != 17 || attempt.EndpointState.CodexAccountID != "acct_123" {
 		t.Fatalf("attempt=%+v", attempt)
+	}
+	if attempt.RequestID != "resp-codex-123" ||
+		attempt.ProviderRequestID != "resp-codex-123" {
+		t.Fatalf("attempt request identity=%+v", attempt)
 	}
 }
 

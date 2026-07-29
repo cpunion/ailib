@@ -20,13 +20,15 @@ import (
 // incremental output text (for callers that stream partials) plus a fatal error
 // for terminal failure events, leaving the iter.Seq2 plumbing to the caller.
 type responsesAccumulator struct {
-	textBuilder strings.Builder
-	calls       []*codexResponseCall
-	callsByID   map[string]*codexResponseCall
-	images      []*genai.Blob
-	seenImages  map[string]struct{}
-	usage       *genai.GenerateContentResponseUsageMetadata
-	finish      genai.FinishReason
+	textBuilder   strings.Builder
+	calls         []*codexResponseCall
+	callsByID     map[string]*codexResponseCall
+	images        []*genai.Blob
+	seenImages    map[string]struct{}
+	usage         *genai.GenerateContentResponseUsageMetadata
+	finish        genai.FinishReason
+	responseID    string
+	responseModel string
 }
 
 func newResponsesAccumulator() *responsesAccumulator {
@@ -55,6 +57,14 @@ func (a *responsesAccumulator) ensureCall(itemID string) *codexResponseCall {
 // caller emits a partial response when it is non-empty and streaming is on.
 // A non-nil error is terminal: the stream carried an explicit failure.
 func (a *responsesAccumulator) handleEvent(event codexResponsesEvent) (deltaText string, err error) {
+	if event.Response != nil {
+		if strings.TrimSpace(event.Response.ID) != "" {
+			a.responseID = strings.TrimSpace(event.Response.ID)
+		}
+		if strings.TrimSpace(event.Response.Model) != "" {
+			a.responseModel = strings.TrimSpace(event.Response.Model)
+		}
+	}
 	switch event.Type {
 	case "response.output_text.delta":
 		if event.Delta == "" {

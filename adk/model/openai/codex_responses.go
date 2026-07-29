@@ -20,6 +20,8 @@ import (
 	"google.golang.org/genai"
 )
 
+const codexSessionIDMaxRunes = 64
+
 type codexResponsesModel struct {
 	modelName  string
 	config     *ClientConfig
@@ -28,18 +30,28 @@ type codexResponsesModel struct {
 }
 
 type codexResponsesRequest struct {
-	Model        string                   `json:"model"`
-	Store        bool                     `json:"store"`
-	Stream       bool                     `json:"stream"`
-	Instructions string                   `json:"instructions,omitempty"`
-	Input        []any                    `json:"input,omitempty"`
-	Tools        []codexResponsesTool     `json:"tools,omitempty"`
-	ToolChoice   any                      `json:"tool_choice,omitempty"`
-	Reasoning    *codexResponsesReasoning `json:"reasoning,omitempty"`
+	Model             string                   `json:"model"`
+	Store             bool                     `json:"store"`
+	Stream            bool                     `json:"stream"`
+	Instructions      string                   `json:"instructions,omitempty"`
+	Input             []any                    `json:"input,omitempty"`
+	Tools             []codexResponsesTool     `json:"tools,omitempty"`
+	ToolChoice        any                      `json:"tool_choice,omitempty"`
+	ParallelToolCalls bool                     `json:"parallel_tool_calls"`
+	Reasoning         *codexResponsesReasoning `json:"reasoning,omitempty"`
+	Text              *codexResponsesText      `json:"text,omitempty"`
+	Include           []string                 `json:"include,omitempty"`
+	PromptCacheKey    string                   `json:"prompt_cache_key,omitempty"`
+	MaxOutputTokens   *int                     `json:"max_output_tokens,omitempty"`
 }
 
 type codexResponsesReasoning struct {
-	Effort string `json:"effort"`
+	Effort  string `json:"effort"`
+	Summary string `json:"summary,omitempty"`
+}
+
+type codexResponsesText struct {
+	Verbosity string `json:"verbosity"`
 }
 
 type codexResponsesTool struct {
@@ -84,6 +96,8 @@ type codexResponsesOutputContent struct {
 }
 
 type codexResponsesFinal struct {
+	ID                string                 `json:"id,omitempty"`
+	Model             string                 `json:"model,omitempty"`
 	Status            string                 `json:"status"`
 	Usage             *codexResponsesUsage   `json:"usage,omitempty"`
 	Error             *codexResponsesError   `json:"error,omitempty"`
@@ -220,7 +234,9 @@ func (m *codexResponsesModel) GenerateContent(ctx context.Context, req *model.LL
 			yield(nil, err)
 			return
 		}
-		applyCodexSuccessAttempt(&attempt, acc.usage, acc.finish, m.accountID)
+		applyCodexSuccessAttempt(
+			&attempt, acc.usage, acc.finish, m.accountID, acc.responseID,
+		)
 		m.observeAttempt(attempt, start)
 		yield(finalResp, nil)
 	}
@@ -277,9 +293,12 @@ func dedupeStrings(in []string) []string {
 
 func (m *codexResponsesModel) convertRequest(req *model.LLMRequest) (*codexResponsesRequest, error) {
 	out := &codexResponsesRequest{
-		Model:  m.modelName,
-		Store:  false,
-		Stream: true,
+		Model:             m.modelName,
+		Store:             false,
+		Stream:            true,
+		ParallelToolCalls: true,
+		Include:           []string{"reasoning.encrypted_content"},
+		PromptCacheKey:    clampCodexSessionID(m.config.PromptCacheKey),
 	}
 
 	if req.Config != nil && req.Config.SystemInstruction != nil {
@@ -288,8 +307,34 @@ func (m *codexResponsesModel) convertRequest(req *model.LLMRequest) (*codexRespo
 	if strings.TrimSpace(out.Instructions) == "" {
 		out.Instructions = defaultCodexInstructions()
 	}
-	if effort := resolveReasoningEffort("codex", out.Instructions); effort != "" {
-		out.Reasoning = &codexResponsesReasoning{Effort: effort}
+	effort := strings.TrimSpace(m.config.ReasoningEffort)
+	if effort == "" {
+		effort = resolveReasoningEffort("codex", out.Instructions)
+	}
+	if effort != "" {
+		normalized, err := normalizeCodexReasoningEffort(effort)
+		if err != nil {
+			return nil, err
+		}
+		summary, err := normalizeCodexReasoningSummary(m.config.ReasoningSummary)
+		if err != nil {
+			return nil, err
+		}
+		out.Reasoning = &codexResponsesReasoning{
+			Effort:  normalized,
+			Summary: summary,
+		}
+	} else if strings.TrimSpace(m.config.ReasoningSummary) != "" {
+		return nil, fmt.Errorf("codex responses: reasoning summary requires reasoning effort")
+	}
+	verbosity, err := normalizeCodexTextVerbosity(m.config.TextVerbosity)
+	if err != nil {
+		return nil, err
+	}
+	out.Text = &codexResponsesText{Verbosity: verbosity}
+	if req.Config != nil && req.Config.MaxOutputTokens > 0 {
+		maxTokens := int(req.Config.MaxOutputTokens)
+		out.MaxOutputTokens = &maxTokens
 	}
 
 	for _, content := range req.Contents {
@@ -325,6 +370,55 @@ func (m *codexResponsesModel) convertRequest(req *model.LLMRequest) (*codexRespo
 		out.ToolChoice = "auto"
 	}
 	return out, nil
+}
+
+func normalizeCodexReasoningEffort(raw string) (string, error) {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	switch value {
+	case "extra-high", "extra_high", "extrahigh", "x-high", "x_high":
+		value = "xhigh"
+	}
+	switch value {
+	case "none", "minimal", "low", "medium", "high", "xhigh", "max":
+		return value, nil
+	default:
+		return "", fmt.Errorf("codex responses: unsupported reasoning effort %q", raw)
+	}
+}
+
+func normalizeCodexReasoningSummary(raw string) (string, error) {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	if value == "" {
+		return "auto", nil
+	}
+	switch value {
+	case "auto", "concise", "detailed", "off", "on":
+		return value, nil
+	default:
+		return "", fmt.Errorf("codex responses: unsupported reasoning summary %q", raw)
+	}
+}
+
+func normalizeCodexTextVerbosity(raw string) (string, error) {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	if value == "" {
+		return "low", nil
+	}
+	switch value {
+	case "low", "medium", "high":
+		return value, nil
+	default:
+		return "", fmt.Errorf("codex responses: unsupported text verbosity %q", raw)
+	}
+}
+
+func clampCodexSessionID(raw string) string {
+	value := strings.TrimSpace(raw)
+	runes := []rune(value)
+	if len(runes) <= codexSessionIDMaxRunes {
+		return value
+	}
+	return string(runes[:codexSessionIDMaxRunes])
 }
 
 // convertResponsesInputContent maps a genai.Content into OpenAI Responses API
@@ -432,6 +526,12 @@ func (m *codexResponsesModel) sendRequest(ctx context.Context, req *codexRespons
 	httpReq.Header.Set("Accept", "text/event-stream")
 	httpReq.Header.Set("Authorization", "Bearer "+m.config.APIKey)
 	httpReq.Header.Set("chatgpt-account-id", m.accountID)
+	httpReq.Header.Set("OpenAI-Beta", "responses=experimental")
+	httpReq.Header.Set("originator", "ailib")
+	if sessionID := clampCodexSessionID(m.config.PromptCacheKey); sessionID != "" {
+		httpReq.Header.Set("session-id", sessionID)
+		httpReq.Header.Set("x-client-request-id", sessionID)
+	}
 
 	httpResp, err := m.httpClient.Do(httpReq)
 	if err != nil {
@@ -536,7 +636,13 @@ func (m *codexResponsesModel) applyErrorAttempt(attempt *providercontract.ModelA
 	}
 }
 
-func applyCodexSuccessAttempt(attempt *providercontract.ModelAttempt, usage *genai.GenerateContentResponseUsageMetadata, finish genai.FinishReason, accountID string) {
+func applyCodexSuccessAttempt(
+	attempt *providercontract.ModelAttempt,
+	usage *genai.GenerateContentResponseUsageMetadata,
+	finish genai.FinishReason,
+	accountID string,
+	responseID string,
+) {
 	if attempt == nil {
 		return
 	}
@@ -556,6 +662,8 @@ func applyCodexSuccessAttempt(attempt *providercontract.ModelAttempt, usage *gen
 		}
 	}
 	attempt.Cache = attempt.Usage.Cache
+	attempt.RequestID = strings.TrimSpace(responseID)
+	attempt.ProviderRequestID = strings.TrimSpace(responseID)
 	attempt.EndpointState.CodexAccountID = strings.TrimSpace(accountID)
 }
 

@@ -48,6 +48,11 @@ type Config struct {
 	// /chat/completions; EndpointKindResponses routes to the /v1/responses model.
 	// Other providers ignore this field.
 	EndpointKind providercontract.EndpointKind
+	// ReasoningEffort configures reasoning-capable Responses providers without
+	// modifying model-visible instructions.
+	ReasoningEffort  string
+	ReasoningSummary string
+	TextVerbosity    string
 }
 
 // ParseModelString parses a model string with an optional provider prefix.
@@ -242,11 +247,15 @@ func NewFromConfig(ctx context.Context, cfg Config) (adkmodel.LLM, error) {
 		}
 		if accountID != "" && strings.Contains(strings.TrimSpace(baseURL), "/backend-api/codex") {
 			llm, err = openai.NewCodexResponsesModel(ctx, modelName, &openai.ClientConfig{
-				APIKey:      apiKey,
-				BaseURL:     baseURL,
-				Provider:    provider,
-				HTTPClient:  cfg.HTTPClient,
-				AttemptSink: cfg.AttemptSink,
+				APIKey:           apiKey,
+				BaseURL:          baseURL,
+				Provider:         provider,
+				HTTPClient:       cfg.HTTPClient,
+				AttemptSink:      cfg.AttemptSink,
+				PromptCacheKey:   cfg.PromptCacheKey,
+				ReasoningEffort:  cfg.ReasoningEffort,
+				ReasoningSummary: cfg.ReasoningSummary,
+				TextVerbosity:    cfg.TextVerbosity,
 			}, accountID)
 		} else {
 			llm, err = openai.NewModel(ctx, modelName, &openai.ClientConfig{
