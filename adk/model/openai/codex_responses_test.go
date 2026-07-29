@@ -33,7 +33,7 @@ func TestCodexResponsesModelGenerateText(t *testing.T) {
 		seenBeta      string
 		seenOrigin    string
 		seenSession   string
-		seenMaxTokens int
+		seenMaxTokens *int
 		attempts      []providercontract.ModelAttempt
 	)
 
@@ -56,7 +56,7 @@ func TestCodexResponsesModelGenerateText(t *testing.T) {
 			Include      []string                `json:"include"`
 			Parallel     bool                    `json:"parallel_tool_calls"`
 			CacheKey     string                  `json:"prompt_cache_key"`
-			MaxTokens    int                     `json:"max_output_tokens"`
+			MaxTokens    *int                    `json:"max_output_tokens"`
 		}
 		if err := json.Unmarshal(raw, &req); err != nil {
 			t.Fatalf("Unmarshal: %v", err)
@@ -154,8 +154,8 @@ func TestCodexResponsesModelGenerateText(t *testing.T) {
 	if !seenParallel || seenCacheKey != wantSession {
 		t.Fatalf("parallel=%t cacheKey=%q", seenParallel, seenCacheKey)
 	}
-	if seenMaxTokens != 6000 {
-		t.Fatalf("max output tokens=%d", seenMaxTokens)
+	if seenMaxTokens != nil {
+		t.Fatalf("codex backend does not accept max_output_tokens=%d", *seenMaxTokens)
 	}
 	if seenBeta != "responses=experimental" || seenOrigin != "ailib" || seenSession != wantSession {
 		t.Fatalf("headers beta=%q origin=%q session=%q", seenBeta, seenOrigin, seenSession)

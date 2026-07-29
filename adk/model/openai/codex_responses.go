@@ -42,7 +42,6 @@ type codexResponsesRequest struct {
 	Text              *codexResponsesText      `json:"text,omitempty"`
 	Include           []string                 `json:"include,omitempty"`
 	PromptCacheKey    string                   `json:"prompt_cache_key,omitempty"`
-	MaxOutputTokens   *int                     `json:"max_output_tokens,omitempty"`
 }
 
 type codexResponsesReasoning struct {
@@ -332,10 +331,6 @@ func (m *codexResponsesModel) convertRequest(req *model.LLMRequest) (*codexRespo
 		return nil, err
 	}
 	out.Text = &codexResponsesText{Verbosity: verbosity}
-	if req.Config != nil && req.Config.MaxOutputTokens > 0 {
-		maxTokens := int(req.Config.MaxOutputTokens)
-		out.MaxOutputTokens = &maxTokens
-	}
 
 	for _, content := range req.Contents {
 		items, err := convertResponsesInputContent(content)
