@@ -239,7 +239,7 @@ func TestCodexResponsesModelFunctionCallRoundTrip(t *testing.T) {
 		_, _ = w.Write([]byte("data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"a\\\":2\"}\n\n"))
 		_, _ = w.Write([]byte("data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\",\\\"b\\\":3}\"}\n\n"))
 		_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_add\",\"name\":\"add\",\"arguments\":\"{\\\"a\\\":2,\\\"b\\\":3}\"}}\n\n"))
-		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.6-sol\",\"status\":\"completed\"}}\n\n"))
 	}))
 	defer ts.Close()
 
@@ -338,6 +338,352 @@ func TestCodexResponsesModelFunctionCallRoundTrip(t *testing.T) {
 	}
 	if len(seenInput) != 3 {
 		t.Fatalf("input items=%d", len(seenInput))
+	}
+}
+
+func TestCodexResponsesModelReasoningItemRoundTrip(t *testing.T) {
+	const reasoningItem = `{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"Need call the tool."}],"encrypted_content":"opaque-ciphertext"}`
+	var (
+		requestCount int
+		seenInputs   [][]any
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll: %v", err)
+		}
+		var req struct {
+			Input []any `json:"input"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		seenInputs = append(seenInputs, req.Input)
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		if requestCount == 1 {
+			_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.done\",\"item\":" + reasoningItem + "}\n\n"))
+			_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_add\",\"name\":\"add\",\"arguments\":\"{\\\"a\\\":2,\\\"b\\\":3}\"}}\n\n"))
+		} else {
+			_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"5\"}\n\n"))
+		}
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.6-sol\",\"status\":\"completed\"}}\n\n"))
+	}))
+	defer ts.Close()
+
+	llm, err := NewCodexResponsesModel(
+		context.Background(),
+		"gpt-5.6-sol",
+		&ClientConfig{
+			APIKey:     "jwt-token",
+			BaseURL:    ts.URL,
+			HTTPClient: ts.Client(),
+			Provider:   "codex",
+		},
+		"acct_123",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := collectResponses(llm.GenerateContent(
+		context.Background(),
+		&model.LLMRequest{
+			Contents: []*genai.Content{
+				genai.NewContentFromText("What is 2+3?", genai.RoleUser),
+			},
+		},
+		false,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 || first[0].Content == nil {
+		t.Fatalf("first response=%+v", first)
+	}
+	var (
+		thought *genai.Part
+		call    *genai.FunctionCall
+	)
+	for _, part := range first[0].Content.Parts {
+		if part.Thought {
+			thought = part
+		}
+		if part.FunctionCall != nil {
+			call = part.FunctionCall
+		}
+	}
+	if thought == nil {
+		t.Fatal("missing thought")
+	}
+	replayedItem, signatureOK := decodeResponsesReasoningSignature(
+		thought.ThoughtSignature, "codex", "gpt-5.6-sol",
+	)
+	if !signatureOK ||
+		string(replayedItem) != reasoningItem ||
+		thought.Text != "Need call the tool." {
+		t.Fatalf("thought=%+v", thought)
+	}
+	if call == nil || call.ID != "call_add" {
+		t.Fatalf("call=%+v", call)
+	}
+
+	result := genai.NewContentFromFunctionResponse(
+		"add",
+		map[string]any{"result": 5},
+		genai.RoleUser,
+	)
+	result.Parts[0].FunctionResponse.ID = "call_add"
+	_, err = collectResponses(llm.GenerateContent(
+		context.Background(),
+		&model.LLMRequest{
+			Contents: []*genai.Content{
+				genai.NewContentFromText("What is 2+3?", genai.RoleUser),
+				first[0].Content,
+				result,
+			},
+		},
+		false,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seenInputs) != 2 {
+		t.Fatalf("request inputs=%d", len(seenInputs))
+	}
+	var replayed map[string]any
+	for _, item := range seenInputs[1] {
+		object, ok := item.(map[string]any)
+		if ok && object["type"] == "reasoning" {
+			replayed = object
+			break
+		}
+	}
+	if replayed == nil ||
+		replayed["id"] != "rs_1" ||
+		replayed["encrypted_content"] != "opaque-ciphertext" {
+		t.Fatalf("replayed reasoning=%#v input=%#v", replayed, seenInputs[1])
+	}
+}
+
+func TestCodexResponsesModelPreservesReasoningMessageOrder(t *testing.T) {
+	const reasoningItem = `{"id":"rs_order","type":"reasoning","summary":[{"type":"summary_text","text":"Ordered thought."}],"encrypted_content":"ordered-ciphertext"}`
+	var (
+		requestCount int
+		replayInput  []map[string]any
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if requestCount == 2 {
+			var req struct {
+				Input []map[string]any `json:"input"`
+			}
+			if err := json.Unmarshal(raw, &req); err != nil {
+				t.Fatal(err)
+			}
+			replayInput = req.Input
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		if requestCount == 1 {
+			_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.done\",\"item\":" + reasoningItem + "}\n\n"))
+			_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"msg_order\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Final answer.\"}]}}\n\n"))
+		} else {
+			_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"msg_2\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Acknowledged.\"}]}}\n\n"))
+		}
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.6-sol\",\"status\":\"completed\"}}\n\n"))
+	}))
+	defer ts.Close()
+
+	llm, err := NewCodexResponsesModel(context.Background(), "gpt-5.6-sol", &ClientConfig{
+		APIKey: "jwt-token", BaseURL: ts.URL, HTTPClient: ts.Client(), Provider: "codex",
+	}, "acct_123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := collectResponses(llm.GenerateContent(context.Background(), &model.LLMRequest{
+		Contents: []*genai.Content{genai.NewContentFromText("Answer.", genai.RoleUser)},
+	}, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 || first[0].Content == nil || len(first[0].Content.Parts) != 2 {
+		t.Fatalf("first=%+v", first)
+	}
+	if !first[0].Content.Parts[0].Thought ||
+		first[0].Content.Parts[1].Text != "Final answer." {
+		t.Fatalf("parts=%+v", first[0].Content.Parts)
+	}
+
+	_, err = collectResponses(llm.GenerateContent(context.Background(), &model.LLMRequest{
+		Contents: []*genai.Content{
+			genai.NewContentFromText("Answer.", genai.RoleUser),
+			first[0].Content,
+		},
+	}, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replayInput) < 3 ||
+		replayInput[1]["type"] != "reasoning" ||
+		replayInput[2]["type"] != "message" {
+		t.Fatalf("replay input order=%#v", replayInput)
+	}
+}
+
+func TestCodexResponsesModelForeignReasoningSignatureFallsBackToText(t *testing.T) {
+	otherModelSignature, err := encodeResponsesReasoningSignature(
+		"codex",
+		"gpt-5.6-terra",
+		"gpt-5.6-terra",
+		json.RawMessage(
+			`{"type":"reasoning","encrypted_content":"model-bound"}`,
+		),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name      string
+		signature []byte
+	}{
+		{
+			name:      "foreign provider encoding",
+			signature: []byte("anthropic-opaque-signature"),
+		},
+		{
+			name:      "other model envelope",
+			signature: otherModelSignature,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var input []map[string]any
+			ts := httptest.NewServer(http.HandlerFunc(func(
+				w http.ResponseWriter,
+				r *http.Request,
+			) {
+				raw, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var req struct {
+					Input []map[string]any `json:"input"`
+				}
+				if err := json.Unmarshal(raw, &req); err != nil {
+					t.Fatal(err)
+				}
+				input = req.Input
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"))
+			}))
+			defer ts.Close()
+
+			llm, err := NewCodexResponsesModel(context.Background(), "gpt-5.6-sol", &ClientConfig{
+				APIKey: "jwt-token", BaseURL: ts.URL,
+				HTTPClient: ts.Client(), Provider: "codex",
+			}, "acct_123")
+			if err != nil {
+				t.Fatal(err)
+			}
+			foreign := &genai.Part{
+				Text: "portable reasoning summary", Thought: true,
+				ThoughtSignature: test.signature,
+			}
+			_, err = collectResponses(llm.GenerateContent(context.Background(), &model.LLMRequest{
+				Contents: []*genai.Content{{Role: "model", Parts: []*genai.Part{foreign}}},
+			}, false))
+			if err != nil {
+				t.Fatalf("foreign signature must degrade, got %v", err)
+			}
+			if len(input) < 1 || input[0]["type"] != "message" {
+				t.Fatalf("input=%#v", input)
+			}
+			content, _ := input[0]["content"].([]any)
+			if len(content) != 1 {
+				t.Fatalf("message content=%#v", input[0]["content"])
+			}
+			text, _ := content[0].(map[string]any)
+			if text["text"] != "portable reasoning summary" {
+				t.Fatalf("fallback=%#v", input)
+			}
+		})
+	}
+}
+
+func TestResponsesReasoningSignatureRejectsUnstableRoute(t *testing.T) {
+	item := json.RawMessage(
+		`{"type":"reasoning","encrypted_content":"model-bound"}`,
+	)
+	for _, test := range []struct {
+		name          string
+		provider      string
+		requestModel  string
+		responseModel string
+		wantReplay    bool
+	}{
+		{
+			name:     "openrouter auto",
+			provider: "openrouter", requestModel: "auto",
+			responseModel: "anthropic/claude-sonnet-4", wantReplay: false,
+		},
+		{
+			name:     "openrouter auto without effective model",
+			provider: "openrouter", requestModel: "auto",
+			responseModel: "", wantReplay: false,
+		},
+		{
+			name:     "openrouter alias",
+			provider: "openrouter", requestModel: "openai/gpt-5",
+			responseModel: "openai/gpt-5-2026-07-30", wantReplay: false,
+		},
+		{
+			name:     "openai unrelated response",
+			provider: "openai", requestModel: "gpt-5",
+			responseModel: "gpt-4.1-2025-04-14", wantReplay: false,
+		},
+		{
+			name:     "openai versioned response",
+			provider: "openai", requestModel: "gpt-5",
+			responseModel: "gpt-5-2026-07-30", wantReplay: true,
+		},
+		{
+			name:     "codex versioned response",
+			provider: "codex", requestModel: "gpt-5.6-sol",
+			responseModel: "gpt-5.6-sol-2026-07-30", wantReplay: true,
+		},
+		{
+			name:     "exact route",
+			provider: "openrouter", requestModel: "openai/gpt-5",
+			responseModel: "openai/gpt-5", wantReplay: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			signature, err := encodeResponsesReasoningSignature(
+				test.provider,
+				test.requestModel,
+				test.responseModel,
+				item,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, replay := decodeResponsesReasoningSignature(
+				signature,
+				test.provider,
+				test.requestModel,
+			)
+			if replay != test.wantReplay {
+				t.Fatalf(
+					"replay=%v want=%v signature=%s",
+					replay,
+					test.wantReplay,
+					signature,
+				)
+			}
+		})
 	}
 }
 

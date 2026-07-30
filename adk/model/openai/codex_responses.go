@@ -49,6 +49,16 @@ type codexResponsesReasoning struct {
 	Summary string `json:"summary,omitempty"`
 }
 
+const responsesReasoningSignatureVersion = "ailib.responses.reasoning.v1"
+
+type responsesReasoningSignature struct {
+	Version       string          `json:"version"`
+	Provider      string          `json:"provider"`
+	Model         string          `json:"model"`
+	ResponseModel string          `json:"responseModel,omitempty"`
+	Item          json.RawMessage `json:"item"`
+}
+
 type codexResponsesText struct {
 	Verbosity string `json:"verbosity"`
 }
@@ -87,6 +97,19 @@ type codexResponsesOutputItem struct {
 	Status        string                        `json:"status,omitempty"`
 	RevisedPrompt string                        `json:"revised_prompt,omitempty"`
 	Result        string                        `json:"result,omitempty"`
+	Summary       []codexResponsesOutputContent `json:"summary,omitempty"`
+	rawJSON       json.RawMessage
+}
+
+func (i *codexResponsesOutputItem) UnmarshalJSON(data []byte) error {
+	type itemAlias codexResponsesOutputItem
+	var decoded itemAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*i = codexResponsesOutputItem(decoded)
+	i.rawJSON = append(i.rawJSON[:0], data...)
+	return nil
 }
 
 type codexResponsesOutputContent struct {
@@ -95,12 +118,13 @@ type codexResponsesOutputContent struct {
 }
 
 type codexResponsesFinal struct {
-	ID                string                 `json:"id,omitempty"`
-	Model             string                 `json:"model,omitempty"`
-	Status            string                 `json:"status"`
-	Usage             *codexResponsesUsage   `json:"usage,omitempty"`
-	Error             *codexResponsesError   `json:"error,omitempty"`
-	IncompleteDetails *codexIncompleteReason `json:"incomplete_details,omitempty"`
+	ID                string                     `json:"id,omitempty"`
+	Model             string                     `json:"model,omitempty"`
+	Status            string                     `json:"status"`
+	Output            []codexResponsesOutputItem `json:"output,omitempty"`
+	Usage             *codexResponsesUsage       `json:"usage,omitempty"`
+	Error             *codexResponsesError       `json:"error,omitempty"`
+	IncompleteDetails *codexIncompleteReason     `json:"incomplete_details,omitempty"`
 }
 
 type codexResponsesUsage struct {
@@ -196,7 +220,14 @@ func (m *codexResponsesModel) GenerateContent(ctx context.Context, req *model.LL
 
 			var event codexResponsesEvent
 			if err := json.Unmarshal([]byte(data), &event); err != nil {
-				continue
+				err = fmt.Errorf(
+					"decode codex responses stream event: %w",
+					err,
+				)
+				m.applyErrorAttempt(&attempt, err)
+				m.observeAttempt(attempt, start)
+				yield(nil, err)
+				return
 			}
 
 			delta, evErr := acc.handleEvent(event)
@@ -225,8 +256,23 @@ func (m *codexResponsesModel) GenerateContent(ctx context.Context, req *model.LL
 			yield(nil, err)
 			return
 		}
+		if !acc.terminal {
+			err := fmt.Errorf(
+				"codex responses stream ended without a terminal event",
+			)
+			m.applyErrorAttempt(&attempt, err)
+			m.observeAttempt(attempt, start)
+			yield(nil, err)
+			return
+		}
 
-		finalResp, err := buildCodexFinalResponse(acc.textBuilder.String(), acc.images, acc.calls, acc.usage, acc.finish)
+		finalResp, err := buildCodexFinalResponse(
+			acc,
+			"codex",
+			m.modelName,
+			acc.usage,
+			acc.finish,
+		)
 		if err != nil {
 			m.applyErrorAttempt(&attempt, err)
 			m.observeAttempt(attempt, start)
@@ -333,7 +379,11 @@ func (m *codexResponsesModel) convertRequest(req *model.LLMRequest) (*codexRespo
 	out.Text = &codexResponsesText{Verbosity: verbosity}
 
 	for _, content := range req.Contents {
-		items, err := convertResponsesInputContent(content)
+		items, err := convertResponsesInputContent(
+			content,
+			"codex",
+			m.modelName,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -419,7 +469,11 @@ func clampCodexSessionID(raw string) string {
 // convertResponsesInputContent maps a genai.Content into OpenAI Responses API
 // input items (message / function_call / function_call_output). It is shared by
 // the Codex backend and the generic /v1/responses model.
-func convertResponsesInputContent(content *genai.Content) ([]any, error) {
+func convertResponsesInputContent(
+	content *genai.Content,
+	provider string,
+	modelName string,
+) ([]any, error) {
 	if content == nil || len(content.Parts) == 0 {
 		return nil, nil
 	}
@@ -434,15 +488,44 @@ func convertResponsesInputContent(content *genai.Content) ([]any, error) {
 
 	messageParts := make([]map[string]any, 0, len(content.Parts))
 	items := make([]any, 0, len(content.Parts))
+	flushMessage := func() {
+		if len(messageParts) == 0 {
+			return
+		}
+		items = append(items, map[string]any{
+			"type":    "message",
+			"role":    role,
+			"content": messageParts,
+		})
+		messageParts = nil
+	}
 
 	for _, part := range content.Parts {
 		switch {
 		case part == nil:
 			continue
+		case part.Thought && len(part.ThoughtSignature) > 0:
+			raw, ok := decodeResponsesReasoningSignature(
+				part.ThoughtSignature,
+				provider,
+				modelName,
+			)
+			if ok {
+				flushMessage()
+				items = append(items, raw)
+				continue
+			}
+			if part.Text != "" {
+				messageParts = append(messageParts, map[string]any{
+					"type": "output_text",
+					"text": part.Text,
+				})
+			}
 		case part.FunctionResponse != nil:
 			if strings.TrimSpace(part.FunctionResponse.ID) == "" {
 				continue
 			}
+			flushMessage()
 			raw, err := json.Marshal(part.FunctionResponse.Response)
 			if err != nil {
 				return nil, fmt.Errorf("marshal function response: %w", err)
@@ -453,6 +536,7 @@ func convertResponsesInputContent(content *genai.Content) ([]any, error) {
 				"output":  string(raw),
 			})
 		case part.FunctionCall != nil:
+			flushMessage()
 			argsJSON, err := json.Marshal(part.FunctionCall.Args)
 			if err != nil {
 				return nil, fmt.Errorf("marshal function call args: %w", err)
@@ -496,14 +580,102 @@ func convertResponsesInputContent(content *genai.Content) ([]any, error) {
 		}
 	}
 
-	if len(messageParts) > 0 {
-		items = append([]any{map[string]any{
-			"type":    "message",
-			"role":    role,
-			"content": messageParts,
-		}}, items...)
-	}
+	flushMessage()
 	return items, nil
+}
+
+func encodeResponsesReasoningSignature(
+	provider string,
+	modelName string,
+	responseModel string,
+	item json.RawMessage,
+) ([]byte, error) {
+	var decoded struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(item, &decoded); err != nil {
+		return nil, fmt.Errorf("decode reasoning item: %w", err)
+	}
+	if decoded.Type != "reasoning" {
+		return nil, fmt.Errorf(
+			"reasoning item has type %q",
+			decoded.Type,
+		)
+	}
+	return json.Marshal(responsesReasoningSignature{
+		Version:       responsesReasoningSignatureVersion,
+		Provider:      strings.TrimSpace(provider),
+		Model:         strings.TrimSpace(modelName),
+		ResponseModel: strings.TrimSpace(responseModel),
+		Item:          append(json.RawMessage(nil), item...),
+	})
+}
+
+func decodeResponsesReasoningSignature(
+	raw []byte,
+	provider string,
+	modelName string,
+) (json.RawMessage, bool) {
+	var signature responsesReasoningSignature
+	if err := json.Unmarshal(raw, &signature); err != nil {
+		return nil, false
+	}
+	if signature.Version != responsesReasoningSignatureVersion ||
+		!strings.EqualFold(
+			strings.TrimSpace(signature.Provider),
+			strings.TrimSpace(provider),
+		) ||
+		strings.TrimSpace(signature.Model) != strings.TrimSpace(modelName) ||
+		len(signature.Item) == 0 {
+		return nil, false
+	}
+	if !responsesReplayRouteStable(
+		signature.Provider,
+		signature.Model,
+		signature.ResponseModel,
+	) {
+		return nil, false
+	}
+	var item struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(signature.Item, &item); err != nil ||
+		item.Type != "reasoning" {
+		return nil, false
+	}
+	return append(json.RawMessage(nil), signature.Item...), true
+}
+
+func responsesReplayRouteStable(
+	provider string,
+	requestModel string,
+	responseModel string,
+) bool {
+	requestModel = strings.TrimSpace(requestModel)
+	responseModel = strings.TrimSpace(responseModel)
+	if responseModel == "" {
+		return false
+	}
+	if strings.EqualFold(requestModel, responseModel) {
+		return true
+	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider != "openai" && provider != "codex" {
+		return false
+	}
+	return isDatedModelSnapshot(requestModel, responseModel)
+}
+
+func isDatedModelSnapshot(alias string, snapshot string) bool {
+	alias = strings.ToLower(strings.TrimSpace(alias))
+	snapshot = strings.ToLower(strings.TrimSpace(snapshot))
+	prefix := alias + "-"
+	if alias == "" || !strings.HasPrefix(snapshot, prefix) {
+		return false
+	}
+	date := strings.TrimPrefix(snapshot, prefix)
+	parsed, err := time.Parse("2006-01-02", date)
+	return err == nil && parsed.Format("2006-01-02") == date
 }
 
 func (m *codexResponsesModel) sendRequest(ctx context.Context, req *codexResponsesRequest) (*http.Response, error) {
@@ -540,31 +712,97 @@ func (m *codexResponsesModel) sendRequest(ctx context.Context, req *codexRespons
 	return httpResp, nil
 }
 
-func buildCodexFinalResponse(text string, images []*genai.Blob, calls []*codexResponseCall, usage *genai.GenerateContentResponseUsageMetadata, finish genai.FinishReason) (*model.LLMResponse, error) {
-	parts := make([]*genai.Part, 0, len(images)+len(calls)+1)
-	if text != "" {
-		parts = append(parts, genai.NewPartFromText(text))
-	}
-	for _, image := range images {
-		if image == nil || len(image.Data) == 0 {
-			continue
-		}
-		parts = append(parts, &genai.Part{InlineData: image})
-	}
-	for _, call := range calls {
+func buildCodexFinalResponse(
+	acc *responsesAccumulator,
+	provider string,
+	modelName string,
+	usage *genai.GenerateContentResponseUsageMetadata,
+	finish genai.FinishReason,
+) (*model.LLMResponse, error) {
+	parts := make([]*genai.Part, 0, len(acc.outputs)+1)
+	emittedCalls := map[*codexResponseCall]struct{}{}
+	emittedText := false
+	appendCall := func(call *codexResponseCall) error {
 		if call == nil || strings.TrimSpace(call.name) == "" {
-			continue
+			return nil
 		}
 		args := map[string]any{}
 		rawArgs := strings.TrimSpace(call.arguments.String())
 		if rawArgs != "" {
 			if err := json.Unmarshal([]byte(rawArgs), &args); err != nil {
-				return nil, fmt.Errorf("failed to decode function call arguments for %s: %w", call.name, err)
+				return fmt.Errorf(
+					"failed to decode function call arguments for %s: %w",
+					call.name,
+					err,
+				)
 			}
 		}
 		part := genai.NewPartFromFunctionCall(call.name, args)
-		part.FunctionCall.ID = firstNonEmptyString(call.callID, call.itemID)
+		part.FunctionCall.ID = firstNonEmptyString(
+			call.callID,
+			call.itemID,
+		)
 		parts = append(parts, part)
+		emittedCalls[call] = struct{}{}
+		return nil
+	}
+	for _, output := range acc.outputs {
+		if output == nil || !output.done {
+			continue
+		}
+		switch output.kind {
+		case "reasoning":
+			if output.reasoning == nil ||
+				len(output.reasoning.rawJSON) == 0 {
+				continue
+			}
+			signature, err := encodeResponsesReasoningSignature(
+				provider,
+				modelName,
+				acc.responseModel,
+				output.reasoning.rawJSON,
+			)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, &genai.Part{
+				Text:             output.reasoning.summary,
+				Thought:          true,
+				ThoughtSignature: signature,
+			})
+		case "message":
+			if output.text.Len() == 0 {
+				continue
+			}
+			parts = append(
+				parts,
+				genai.NewPartFromText(output.text.String()),
+			)
+			emittedText = true
+		case "image_generation_call":
+			if output.image == nil || len(output.image.Data) == 0 {
+				continue
+			}
+			parts = append(parts, &genai.Part{InlineData: output.image})
+		case "function_call":
+			if err := appendCall(output.call); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if !emittedText && acc.textBuilder.Len() > 0 {
+		parts = append(
+			parts,
+			genai.NewPartFromText(acc.textBuilder.String()),
+		)
+	}
+	for _, call := range acc.calls {
+		if _, ok := emittedCalls[call]; ok {
+			continue
+		}
+		if err := appendCall(call); err != nil {
+			return nil, err
+		}
 	}
 	if len(parts) == 0 {
 		parts = append(parts, genai.NewPartFromText(" "))

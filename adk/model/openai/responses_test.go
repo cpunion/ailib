@@ -23,6 +23,7 @@ func TestResponsesModelGenerateText(t *testing.T) {
 		seenStream  bool
 		seenPrompt  string
 		seenCache   string
+		seenInclude []string
 		seenInput   []any
 		attempts    []providercontract.ModelAttempt
 	)
@@ -30,11 +31,12 @@ func TestResponsesModelGenerateText(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		var req struct {
-			Model          string `json:"model"`
-			Stream         bool   `json:"stream"`
-			Instructions   string `json:"instructions"`
-			PromptCacheKey string `json:"prompt_cache_key"`
-			Input          []any  `json:"input"`
+			Model          string   `json:"model"`
+			Stream         bool     `json:"stream"`
+			Instructions   string   `json:"instructions"`
+			PromptCacheKey string   `json:"prompt_cache_key"`
+			Include        []string `json:"include"`
+			Input          []any    `json:"input"`
 		}
 		if err := json.Unmarshal(raw, &req); err != nil {
 			t.Fatalf("Unmarshal: %v", err)
@@ -46,6 +48,7 @@ func TestResponsesModelGenerateText(t *testing.T) {
 		seenStream = req.Stream
 		seenPrompt = req.Instructions
 		seenCache = req.PromptCacheKey
+		seenInclude = req.Include
 		seenInput = req.Input
 
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -103,6 +106,10 @@ func TestResponsesModelGenerateText(t *testing.T) {
 	if seenCache != "sess-cache-key" {
 		t.Fatalf("prompt_cache_key=%q want sess-cache-key", seenCache)
 	}
+	if len(seenInclude) != 1 ||
+		seenInclude[0] != "reasoning.encrypted_content" {
+		t.Fatalf("include=%v", seenInclude)
+	}
 	if len(seenInput) != 1 {
 		t.Fatalf("input items=%d", len(seenInput))
 	}
@@ -151,6 +158,33 @@ func TestResponsesModelRequestScopedCacheKeyOverridesConfig(t *testing.T) {
 	}
 	if seenCache != "per-request-key" {
 		t.Fatalf("prompt_cache_key=%q want per-request-key", seenCache)
+	}
+}
+
+func TestResponsesModelEncryptedReasoningIncludeByProvider(t *testing.T) {
+	for _, tc := range []struct {
+		provider string
+		want     bool
+	}{
+		{provider: "openai", want: true},
+		{provider: "openrouter", want: true},
+		{provider: "groq", want: false},
+	} {
+		t.Run(tc.provider, func(t *testing.T) {
+			m := &responsesModel{
+				modelName: "test-model",
+				config:    &ClientConfig{Provider: tc.provider},
+			}
+			request, err := m.convertRequest(&model.LLMRequest{})
+			if err != nil {
+				t.Fatalf("convertRequest: %v", err)
+			}
+			got := len(request.Include) == 1 &&
+				request.Include[0] == "reasoning.encrypted_content"
+			if got != tc.want {
+				t.Fatalf("include=%v wantEncryptedReasoning=%v", request.Include, tc.want)
+			}
+		})
 	}
 }
 
@@ -249,5 +283,179 @@ func TestResponsesModelAttemptSinkRecordsHTTPFailure(t *testing.T) {
 	}
 	if a.EndpointKind != providercontract.EndpointKindResponses {
 		t.Fatalf("endpointKind=%v", a.EndpointKind)
+	}
+}
+
+func TestResponsesModelRejectsMissingTerminalEvent(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		_ *http.Request,
+	) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(
+			"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+		))
+	}))
+	defer ts.Close()
+	llm, err := NewResponsesModel(
+		context.Background(),
+		"gpt-5.6-terra",
+		&ClientConfig{
+			APIKey: "sk-test", BaseURL: ts.URL, HTTPClient: ts.Client(),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := collectResponses(llm.GenerateContent(
+		context.Background(),
+		&model.LLMRequest{
+			Contents: []*genai.Content{
+				genai.NewContentFromText("hi", genai.RoleUser),
+			},
+		},
+		false,
+	)); err == nil || !strings.Contains(err.Error(), "terminal event") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestResponsesModelIncompleteIsMaxTokens(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		_ *http.Request,
+	) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(
+			"data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+		))
+	}))
+	defer ts.Close()
+	llm, err := NewResponsesModel(
+		context.Background(),
+		"gpt-5.6-terra",
+		&ClientConfig{
+			APIKey: "sk-test", BaseURL: ts.URL, HTTPClient: ts.Client(),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responses, err := collectResponses(llm.GenerateContent(
+		context.Background(),
+		&model.LLMRequest{
+			Contents: []*genai.Content{
+				genai.NewContentFromText("hi", genai.RoleUser),
+			},
+		},
+		false,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(responses) != 1 ||
+		responses[0].FinishReason != genai.FinishReasonMaxTokens {
+		t.Fatalf("responses=%+v", responses)
+	}
+}
+
+func TestResponsesModelBackfillsOnlyMissingTerminalEncryptedReasoning(
+	t *testing.T,
+) {
+	for _, test := range []struct {
+		name              string
+		doneEncrypted     string
+		terminalEncrypted string
+		wantEncrypted     string
+	}{
+		{
+			name:              "terminal backfill",
+			terminalEncrypted: "ENC-FINAL",
+			wantEncrypted:     "ENC-FINAL",
+		},
+		{
+			name:              "completed item remains authoritative",
+			doneEncrypted:     "ENC-DONE",
+			terminalEncrypted: "ENC-TERMINAL",
+			wantEncrypted:     "ENC-DONE",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			doneEncrypted := ""
+			if test.doneEncrypted != "" {
+				doneEncrypted =
+					`,"encrypted_content":"` + test.doneEncrypted + `"`
+			}
+			ts := httptest.NewServer(http.HandlerFunc(func(
+				w http.ResponseWriter,
+				_ *http.Request,
+			) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(
+					w,
+					`data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"inspect"}],"provider_extension":{"v":1}`+
+						doneEncrypted+"}}\n\n",
+				)
+				_, _ = io.WriteString(
+					w,
+					`data: {"type":"response.completed","response":{"model":"gpt-5","status":"completed","output":[{"id":"rs_1","type":"reasoning","encrypted_content":"`+
+						test.terminalEncrypted+
+						`","provider_extension":{"v":2}}]}}`+"\n\n",
+				)
+			}))
+			defer ts.Close()
+
+			llm, err := NewResponsesModel(
+				context.Background(),
+				"gpt-5",
+				&ClientConfig{
+					APIKey:     "sk-test",
+					BaseURL:    ts.URL,
+					HTTPClient: ts.Client(),
+					Provider:   "openai",
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			responses, err := collectResponses(llm.GenerateContent(
+				context.Background(),
+				&model.LLMRequest{
+					Contents: []*genai.Content{
+						genai.NewContentFromText(
+							"inspect",
+							genai.RoleUser,
+						),
+					},
+				},
+				false,
+			))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(responses) != 1 ||
+				responses[0].Content == nil ||
+				len(responses[0].Content.Parts) != 1 {
+				t.Fatalf("responses=%+v", responses)
+			}
+			part := responses[0].Content.Parts[0]
+			raw, ok := decodeResponsesReasoningSignature(
+				part.ThoughtSignature,
+				"openai",
+				"gpt-5",
+			)
+			if !ok {
+				t.Fatalf("signature=%s", part.ThoughtSignature)
+			}
+			var item map[string]any
+			if err := json.Unmarshal(raw, &item); err != nil {
+				t.Fatal(err)
+			}
+			extension, _ := item["provider_extension"].(map[string]any)
+			if item["encrypted_content"] != test.wantEncrypted ||
+				extension["v"] != float64(1) {
+				t.Fatalf("item=%#v", item)
+			}
+		})
 	}
 }

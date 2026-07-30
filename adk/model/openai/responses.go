@@ -55,6 +55,7 @@ type responsesRequest struct {
 	Tools           []codexResponsesTool     `json:"tools,omitempty"`
 	ToolChoice      any                      `json:"tool_choice,omitempty"`
 	Reasoning       *codexResponsesReasoning `json:"reasoning,omitempty"`
+	Include         []string                 `json:"include,omitempty"`
 	PromptCacheKey  string                   `json:"prompt_cache_key,omitempty"`
 	MaxOutputTokens *int                     `json:"max_output_tokens,omitempty"`
 	Temperature     *float64                 `json:"temperature,omitempty"`
@@ -142,7 +143,14 @@ func (m *responsesModel) GenerateContent(ctx context.Context, req *model.LLMRequ
 			}
 			var event codexResponsesEvent
 			if err := json.Unmarshal([]byte(data), &event); err != nil {
-				continue
+				err = fmt.Errorf(
+					"decode openai responses stream event: %w",
+					err,
+				)
+				m.applyErrorAttempt(&attempt, err)
+				m.observeAttempt(attempt, start)
+				yield(nil, err)
+				return
 			}
 			delta, evErr := acc.handleEvent(event)
 			if evErr != nil {
@@ -170,8 +178,23 @@ func (m *responsesModel) GenerateContent(ctx context.Context, req *model.LLMRequ
 			yield(nil, err)
 			return
 		}
+		if !acc.terminal {
+			err := fmt.Errorf(
+				"openai responses stream ended without a terminal event",
+			)
+			m.applyErrorAttempt(&attempt, err)
+			m.observeAttempt(attempt, start)
+			yield(nil, err)
+			return
+		}
 
-		finalResp, err := buildCodexFinalResponse(acc.textBuilder.String(), acc.images, acc.calls, acc.usage, acc.finish)
+		finalResp, err := buildCodexFinalResponse(
+			acc,
+			m.provider(),
+			m.modelName,
+			acc.usage,
+			acc.finish,
+		)
 		if err != nil {
 			m.applyErrorAttempt(&attempt, err)
 			m.observeAttempt(attempt, start)
@@ -185,7 +208,13 @@ func (m *responsesModel) GenerateContent(ctx context.Context, req *model.LLMRequ
 }
 
 func (m *responsesModel) convertRequest(req *model.LLMRequest) (*responsesRequest, error) {
-	out := &responsesRequest{Model: m.modelName, Stream: true}
+	out := &responsesRequest{
+		Model:  m.modelName,
+		Stream: true,
+	}
+	if supportsEncryptedReasoningInclude(m.provider()) {
+		out.Include = []string{"reasoning.encrypted_content"}
+	}
 
 	if req.Config != nil && req.Config.SystemInstruction != nil {
 		out.Instructions = extractTextFromContent(req.Config.SystemInstruction)
@@ -195,7 +224,11 @@ func (m *responsesModel) convertRequest(req *model.LLMRequest) (*responsesReques
 	}
 
 	for _, content := range req.Contents {
-		items, err := convertResponsesInputContent(content)
+		items, err := convertResponsesInputContent(
+			content,
+			m.provider(),
+			m.modelName,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -233,6 +266,15 @@ func (m *responsesModel) convertRequest(req *model.LLMRequest) (*responsesReques
 		}
 	}
 	return out, nil
+}
+
+func supportsEncryptedReasoningInclude(provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "openai", "openrouter":
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *responsesModel) sendRequest(ctx context.Context, req *responsesRequest) (*http.Response, error) {
